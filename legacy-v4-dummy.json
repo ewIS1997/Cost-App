@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 4,
+  "darkMode": false,
+  "activeSheetId": "dummy-sheet-1",
+  "sheets": [
+    {
+      "id": "dummy-sheet-1",
+      "name": "Sheet 1",
+      "rows": [
+        {
+          "id": "dummy-row-1",
+          "boqCode": "A-100",
+          "resource": "Concrete",
+          "cqbi": 2,
+          "cr": 1,
+          "rate": 125.5,
+          "override": null,
+          "boqQtyOverride": null,
+          "unassignedQty": null,
+          "remark": "Synthetic sample row"
+        }
+      ],
+      "quantities": {
+        "A-100": 10
+      },
+      "columnWidths": [128, 190, 100, 90, 110, 120, 110, 125, 105, 145, 220],
+      "filters": {},
+      "sort": null,
+      "hiddenColumnKeys": ["remark"]
+    }
+  ]
+}

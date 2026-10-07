@@ -1,0 +1,10 @@
+/** @typedef {{ id: string, boqCode: string, resource: string, cqbi: number|null, unit: string, cr: number|null, rate: number|null, override: number|null, boqQty: number|null, remark: string }} CostRow */
+/** CostRow persists only its authoritative input fields; cost, usedCost and totalCost are derived and never persisted. */
+/** @typedef {{ search: string, condition: string, conditionValue: string, conditionValue2: string, selected: string[]|null }} ColumnFilter */
+/** @typedef {{ schemaVersion: 4, rows: CostRow[], columnWidths: number[], filters: Object<string,ColumnFilter>, sort: {col:number,direction:'asc'|'desc'}|null, hiddenColumnKeys: string[] }} WorksheetData */
+/** @typedef {{ id:string, projectId:string, name:string, position:number, data:WorksheetData, createdAt:string, updatedAt:string }} SheetRecord */
+/** @typedef {{ id:string, name:string, activeSheetId:string, darkMode:boolean, routeSlug?:string, routeAliases?:string[], createdAt:string, updatedAt:string }} ProjectRecord */
+/** @typedef {{ id:string, projectId:string, name:string, sourceSheetName:string, sourceBoqCode:string, rows:Omit<CostRow,'id'|'boqCode'>[], createdAt:string, updatedAt:string }} AssemblyRecord */
+/** @typedef {{ id:'app', schemaVersion:3, theme:'system'|'light'|'warm'|'dark', fontSize:'small'|'default'|'large', fontFamily:'inter'|'manrope'|'source-sans-3'|'atkinson-hyperlegible', density:'compact'|'comfortable', quantityDecimals:number, costDecimals:number, useGrouping:boolean, currencyLabel:string, defaultDarkMode:boolean, defaultRemarkVisible:boolean, storageNoticeDismissed:boolean }} AppSettings */
+/** @typedef {{ backupType:'boq-cost-load-project', schemaVersion:1, exportedAt:string, project:ProjectRecord, sheets:SheetRecord[], assemblies?:AssemblyRecord[] }} ProjectBackupV1 */
+/** @typedef {{ backupType:'boq-cost-load-all-projects', schemaVersion:1, exportedAt:string, projects:ProjectRecord[], sheets:SheetRecord[], assemblies?:AssemblyRecord[], settings:AppSettings }} AllProjectsBackupV1 */
