@@ -1,4 +1,30 @@
 import { FILL_CELL_LIMIT, ROW_LIMIT } from '../../domain/constants.js'
+import { getRowDerivedValues } from '../../domain/calculations.js'
+
+export function clipboardCellValue(row, key) {
+  return row.expressions?.[key] ?? row[key] ?? ''
+}
+
+function copiedValue(row, key) {
+  return key === 'cost' || key === 'usedCost' || key === 'totalCost'
+    ? getRowDerivedValues(row)[key] ?? '' : clipboardCellValue(row, key)
+}
+
+export function buildCellClipboardMatrix(rowModel, columns, selectionBounds) {
+  if (!selectionBounds) return []
+  const matrix = []
+  for (let rowIndex = selectionBounds.top; rowIndex <= selectionBounds.bottom; rowIndex++) {
+    const row = rowModel[rowIndex]?.original
+    if (!row) continue
+    matrix.push(columns.slice(selectionBounds.left, selectionBounds.right + 1)
+      .map((column) => copiedValue(row, column.key)))
+  }
+  return matrix
+}
+
+export function buildRowClipboardMatrix(rows, columns) {
+  return rows.map((row) => columns.map((column) => copiedValue(row, column.key)))
+}
 
 export function parseClipboardText(text) {
   const source = String(text ?? '').replace(/\r\n?/g, '\n')
@@ -30,6 +56,28 @@ export function serializeClipboardMatrix(matrix) {
     const text = String(value ?? '')
     return /[\t\r\n"]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
   }).join('\t')).join('\r\n')
+}
+
+export function clipboardTableTextFromHtml(html) {
+  if (typeof DOMParser === 'undefined' || !html) return null
+  const document = new DOMParser().parseFromString(String(html), 'text/html')
+  const table = document.querySelector('table')
+  if (!table) return null
+  const rows = [...table.rows].map((row) => [...row.cells].map((cell) => cell.innerText ?? cell.textContent ?? ''))
+  return rows.length ? serializeClipboardMatrix(rows) : null
+}
+
+export function classifyClipboardPaste(clipboardData) {
+  const text = clipboardData?.getData?.('text/plain') ?? ''
+  if (text !== '') return { type: 'text', source: 'plain', text }
+
+  const htmlText = clipboardTableTextFromHtml(clipboardData?.getData?.('text/html') ?? '')
+  if (htmlText !== null) return { type: 'text', source: 'html', text: htmlText }
+
+  const imageItem = Array.from(clipboardData?.items ?? [])
+    .find((item) => item.kind === 'file' && item.type.startsWith('image/'))
+  if (imageItem) return { type: 'image', source: 'image', imageItem }
+  return { type: 'text', source: 'empty', text }
 }
 
 export function getPasteTargets(matrix, bounds, columnCount, selectedRange = false) {

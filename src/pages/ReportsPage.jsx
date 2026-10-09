@@ -6,7 +6,8 @@ import { DEFAULT_FILTER } from '../domain/constants.js'
 import { createProjectSummaryRows } from '../domain/reportRows.js'
 import { projectVisibleRowIds } from '../domain/projection.js'
 import { summarizeProject } from '../domain/projectSummary.js'
-import { FilterMenu } from '../features/cost-grid/CostGrid.jsx'
+import { FilterMenu } from '../features/filtering/FilterMenu.jsx'
+import { serializeClipboardMatrix } from '../features/cost-grid/clipboard.js'
 import { useWorkspaceStore } from '../stores/workspaceStore.js'
 import { notify, useUiStore } from '../stores/uiStore.js'
 
@@ -35,7 +36,8 @@ export function ReportsPage() {
   const projectSummary = useMemo(() => summarizeProject(sheets), [sheets])
   const summaryRows = useMemo(() => createProjectSummaryRows(sheets), [sheets])
   const scopedSummaryRows = useMemo(() => sheetId === 'all' ? summaryRows : summaryRows.filter((row) => row.sheetId === sheetId), [summaryRows, sheetId])
-  const filterRows = useMemo(() => scopedSummaryRows.map((row) => ({
+  // Transient report rows reuse worksheet column keys solely for filtering/sorting.
+  const reportFilterRows = useMemo(() => scopedSummaryRows.map((row) => ({
     ...row,
     id: row.id,
     resource: row.sheet,
@@ -44,8 +46,8 @@ export function ReportsPage() {
     override: row.totalCost,
     cr: row.percentage,
   })), [scopedSummaryRows])
-  const visibleSummaryIds = useMemo(() => projectVisibleRowIds(filterRows, summaryFilters, summarySort), [filterRows, summaryFilters, summarySort])
-  const filterRowById = useMemo(() => new Map(filterRows.map((row) => [row.id, row])), [filterRows])
+  const visibleSummaryIds = useMemo(() => projectVisibleRowIds(reportFilterRows, summaryFilters, summarySort), [reportFilterRows, summaryFilters, summarySort])
+  const filterRowById = useMemo(() => new Map(reportFilterRows.map((row) => [row.id, row])), [reportFilterRows])
   const visibleSummaryRows = visibleSummaryIds.map((id) => filterRowById.get(id)).filter(Boolean)
 
   if (!project) return <div className="placeholder-panel">Loading workspace...</div>
@@ -63,11 +65,7 @@ export function ReportsPage() {
     const values = copiedReport === 'summary'
       ? visibleSummaryRows.map((row) => [row.sheet, row.boqCode || 'Unassigned', row.boqQty ?? '', row.unitCost ?? '', row.totalCost, row.percentage === null ? '' : `${row.percentage}%`])
       : rows.map(({ sheet, row, derived }) => [sheet, row.boqCode, row.resource, row.cqbi ?? '', row.unit, row.cr ?? '', row.rate ?? '', derived.cost ?? '', row.override ?? '', derived.usedCost ?? '', row.boqQty ?? '', derived.totalCost ?? '', row.remark])
-    const quote = (value) => {
-      const text = String(value ?? '')
-      return /[\t\r\n"]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
-    }
-    const text = [headers, ...values].map((line) => line.map(quote).join('\t')).join('\r\n')
+    const text = serializeClipboardMatrix([headers, ...values])
     setCopying(true)
     try {
       if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
@@ -112,7 +110,7 @@ export function ReportsPage() {
         </table></div> : <div className="report-no-results">No matching BQ items. <button type="button" onClick={clearAllFilters}>Clear filters</button></div>}
         {openFilter && <FilterMenu
           column={summaryColumns.find((column) => column.key === openFilter)}
-          rows={filterRows}
+          rows={reportFilterRows}
           currentFilter={summaryFilters[openFilter] ?? { ...DEFAULT_FILTER }}
           sortDirection={summarySort?.col === summaryColumns.find((column) => column.key === openFilter)?.index ? summarySort.direction : null}
           hasSort={Boolean(summarySort)}

@@ -23,7 +23,7 @@ const sourceSheet = {
   data: {
     columnWidths: [128, 190, 100, 100, 90, 110, 120, 110, 125, 105, 145, 220],
     rows: [
-      createRow(' A.01 ', 'Concrete', { cqbi: 0, rate: 0, boqQty: 0, remark: 'Zero values stay valid' }),
+      createRow(' A.01 ', 'Concrete', { cqbi: 0, rate: 0, boqQty: 0, remark: 'Zero values stay valid\nSecond remark line' }),
       createRow('a.01', 'Labour', { cqbi: 4, expressions: { cqbi: '2+2' } }),
       createRow('B.01', 'Steel', { override: 12.5 }),
       createRow('', 'Uncoded note'),
@@ -82,7 +82,7 @@ test('exports styled BOQ groups, formulas, workbook controls, and a compatible i
   const parsed = await parseCostLoadExcel({ size: arrayBuffer.byteLength, arrayBuffer: async () => arrayBuffer })
   assert.equal(parsed.rows.length, sourceSheet.data.rows.length)
   assert.deepEqual(parsed.rows.map(({ boqCode, resource, cqbi, rate, override, boqQty, remark }) => ({ boqCode, resource, cqbi, rate, override, boqQty, remark })), [
-    { boqCode: 'A.01', resource: 'Concrete', cqbi: 0, rate: 0, override: null, boqQty: 0, remark: 'Zero values stay valid' },
+    { boqCode: 'A.01', resource: 'Concrete', cqbi: 0, rate: 0, override: null, boqQty: 0, remark: 'Zero values stay valid\nSecond remark line' },
     { boqCode: 'A.01', resource: 'Labour', cqbi: 4, rate: 10, override: null, boqQty: 3, remark: '' },
     { boqCode: 'B.01', resource: 'Steel', cqbi: 1, rate: 10, override: 12.5, boqQty: 3, remark: '' },
     { boqCode: '', resource: 'Uncoded note', cqbi: 1, rate: 10, override: null, boqQty: 3, remark: '' },

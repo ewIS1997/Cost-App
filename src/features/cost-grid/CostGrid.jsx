@@ -1,164 +1,49 @@
+// Owns grid selection, editor and capture-phase keyboard lifecycles; filter UI is shared with read-only pages.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDown, ArrowDownAZ, ArrowUp, ArrowUpAZ, Check, Filter, Search, X } from 'lucide-react'
+import { ArrowDownAZ, ArrowUpAZ, Filter } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { useTable, tableFeatures } from '@tanstack/react-table'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ConfirmDialog, Modal } from '../../components/Modal.jsx'
+import { ConfirmDialog } from '../../components/Modal.jsx'
 import { COLUMN_DEFINITIONS } from '../../domain/columns.js'
-import { BOQ_CODE_LIMIT, COLUMN_WIDTH_MAX, COLUMN_WIDTH_MIN, DEFAULT_FILTER, FILL_CELL_LIMIT, REMARK_LIMIT, RESOURCE_LIMIT, ROW_LIMIT, UNIT_LIMIT } from '../../domain/constants.js'
+import { COLUMN_WIDTH_MAX, COLUMN_WIDTH_MIN, DEFAULT_FILTER, FILL_CELL_LIMIT, ROW_LIMIT } from '../../domain/constants.js'
 import { formatNumber, getRowDerivedValues } from '../../domain/calculations.js'
 import { summarizeBoqItemCosts } from '../../domain/boqItemCostSummary.js'
-import { createBlankRow, createId, normalizeBoqCode, normalizeResourceText, normalizeText, parseNumeric } from '../../domain/normalization.js'
+import { createBlankRow, createId, normalizeBoqCode } from '../../domain/normalization.js'
 import { copyResourcesToBoq } from '../../domain/resourceCopy.js'
 import { updateWorksheetRowRate } from '../../domain/worksheetRates.js'
-import { getNumericEditText, parseNumericEdit, setNumericEditValue } from '../../domain/numericExpressions.js'
 import { isImageTargetCurrent, prepareImageAttachment, normalizeAttachmentCode } from '../../domain/imageAttachments.js'
-import { getInsertionValuesFromRow, getProjectionValue, isNumericFilterColumn, projectVisibleRowIds } from '../../domain/projection.js'
+import { getInsertionValuesFromRow, getProjectionValue, projectVisibleRowIds } from '../../domain/projection.js'
+import { FilterMenu } from '../filtering/FilterMenu.jsx'
 import { useWorkspaceStore } from '../../stores/workspaceStore.js'
 import { useUiStore } from '../../stores/uiStore.js'
 import { notify } from '../../stores/uiStore.js'
-import { addImageAttachment, deleteImageAttachment, getImageAttachment, listSheetAttachments } from '../../database/repositories.js'
+import { addImageAttachment, deleteImageAttachment, listSheetAttachments } from '../../database/repositories.js'
 import { BoqImageGallery } from './BoqImageGallery.jsx'
+import { BoqImagePreview } from './BoqImagePreview.jsx'
 import { useGridInteraction } from './useGridInteraction.js'
-import { getPasteTargets, parseClipboardText, serializeClipboardMatrix } from './clipboard.js'
+import { buildCellClipboardMatrix, buildRowClipboardMatrix, classifyClipboardPaste, clipboardCellValue, getPasteTargets, parseClipboardText, serializeClipboardMatrix } from './clipboard.js'
+import { collectFindMatches, replaceText } from './gridFind.js'
+import { applyParsedEdit, editCellText, editText, parseEdit, textFields, updateEditableCell } from './gridEdit.js'
+import { imageAttachmentsByCode as groupImageAttachments, lastVisibleIndexByCode as indexLastVisibleRows, rowLayoutSignatures as getRowLayoutSignatures, selectionSummary as getSelectionSummary, visibleBoqGroups as groupVisibleBoqRows } from './gridViewModel.js'
+import { FindReplaceDialog } from './FindReplaceDialog.jsx'
+import { findDirectionalEdge, isBlankCell } from './gridNavigation.js'
+import { gridPositionKey, readGridPosition as readStoredGridPosition, writeGridPosition as writeStoredGridPosition } from './gridPosition.js'
+import { firstCqbiByBoqCode, unitCostPerCqbi } from './boqUnitCostPerCqbi.js'
 
 const coreFeatures = tableFeatures({})
-const GRID_POSITION_PREFIX = 'cost-grid-position-v1'
-let reloadRestorePending = typeof window !== 'undefined'
-  && window.performance?.getEntriesByType('navigation')?.[0]?.type === 'reload'
-
-function gridPositionKey(projectId, sheetId) {
-  return `${GRID_POSITION_PREFIX}:${projectId}:${sheetId}`
-}
-
-function readReloadGridPosition(projectId, sheetId) {
-  if (!reloadRestorePending || !projectId || typeof window === 'undefined') return null
-  try {
-    const value = JSON.parse(window.sessionStorage.getItem(gridPositionKey(projectId, sheetId)) || 'null')
-    return value?.url === window.location.href ? value : null
-  } catch {
-    return null
-  }
-}
-
-function saveGridPosition(key, url, selection, scroller) {
-  if (!key || !selection || !scroller) return
-  try {
-    window.sessionStorage.setItem(key, JSON.stringify({
-      url,
-      active: selection.active,
-      anchor: selection.anchor,
-      extent: selection.extent,
-      scrollTop: scroller.scrollTop,
-      scrollLeft: scroller.scrollLeft,
-    }))
-  } catch {
-    // Session storage can be unavailable or full; grid interaction should still work.
-  }
-}
-const textFields = new Set(['boqCode', 'resource', 'unit', 'remark'])
 const UNIT_SUGGESTIONS = ['kg', 'sheet', 'liter', 'm²', 'm³', 'm', 'pcs', 'ton']
-const textConditions = [
-  ['contains', 'Contains'], ['notContains', 'Does not contain'], ['equals', 'Equals'],
-  ['notEquals', 'Does not equal'], ['startsWith', 'Begins with'], ['endsWith', 'Ends with'],
-  ['isBlank', 'Is blank'], ['isNotBlank', 'Is not blank'],
-]
-const numberConditions = [
-  ['equals', 'Equals'], ['notEquals', 'Does not equal'], ['gt', 'Greater than'],
-  ['gte', 'Greater than or equal'], ['lt', 'Less than'], ['lte', 'Less than or equal'],
-  ['between', 'Between'], ['isBlank', 'Is blank'], ['isNotBlank', 'Is not blank'],
-]
-
+const INPUT_NUMBER_DISPLAY_DECIMALS = 4
 const valueFor = (row, key, preferences) => {
   const derived = getRowDerivedValues(row)
-  return ['cost', 'usedCost', 'boqQty', 'totalCost'].includes(key)
-    ? formatNumber(derived[key],{decimals:key==='boqQty'?preferences?.quantityDecimals:preferences?.costDecimals,useGrouping:preferences?.useGrouping})
-    : row[key] ?? ''
-}
-const isBlankCell = (value) => value === null || value === undefined || (typeof value === 'string' && value.trim() === '')
-
-function findDirectionalEdge(start, direction, count, isBlank) {
-  if (count <= 0 || start < 0 || start >= count) return start
-  const next = start + direction
-  if (next < 0 || next >= count) return start
-
-  const currentIsBlank = isBlank(start)
-  const nextIsBlank = isBlank(next)
-  let index = next
-
-  if (currentIsBlank || nextIsBlank) {
-    while (index >= 0 && index < count && isBlank(index)) index += direction
-    return index >= 0 && index < count ? index : direction > 0 ? count - 1 : 0
+  if (['cost', 'usedCost', 'boqQty', 'totalCost'].includes(key)) {
+    return formatNumber(derived[key], { decimals: key === 'boqQty' ? preferences?.quantityDecimals : preferences?.costDecimals, useGrouping: preferences?.useGrouping })
   }
-
-  while (index + direction >= 0 && index + direction < count && !isBlank(index + direction)) index += direction
-  return index
-}
-
-function editText(row, key) {
-  return row?.[key] === null || row?.[key] === undefined ? '' : String(row[key])
-}
-
-function editCellText(row, key) {
-  if (['cqbi', 'cr', 'rate', 'override', 'boqQty'].includes(key)) return getNumericEditText(row, key)
-  return editText(row, key)
-}
-
-function parseEdit(key, text, { allowExpression = true } = {}) {
-  if (textFields.has(key)) {
-    const value = key === 'boqCode' ? normalizeBoqCode(text) : key === 'resource' ? normalizeResourceText(text) : normalizeText(text)
-    const max = { boqCode: BOQ_CODE_LIMIT, resource: RESOURCE_LIMIT, unit: UNIT_LIMIT, remark: REMARK_LIMIT }[key]
-    return value.length > max ? { error: `${key} must be ${max} characters or fewer.` } : { value, expression: null }
+  if (['cqbi', 'cr', 'rate', 'override'].includes(key)) {
+    return formatNumber(row[key], { decimals: INPUT_NUMBER_DISPLAY_DECIMALS, useGrouping: preferences?.useGrouping })
   }
-  return allowExpression ? parseNumericEdit(text, key) : parseNumeric(text)
+  return row[key] ?? ''
 }
-
-function applyParsedEdit(row, key, parsed) {
-  if (['cqbi', 'cr', 'rate', 'override', 'boqQty'].includes(key)) setNumericEditValue(row, key, parsed)
-  else row[key] = parsed.value
-}
-
-function clipboardCellValue(row, key) {
-  return row.expressions?.[key] ?? row[key] ?? ''
-}
-
-function replaceText(text, query, replacement, matchCase = false, entireCell = false) {
-  if (entireCell) return replacement
-  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return text.replace(new RegExp(escaped, matchCase ? 'g' : 'gi'), () => replacement)
-}
-
-function collectFindMatches(rows, columns, query, matchCase, entireCell, scope = null, limit = Infinity) {
-  if (!query.trim()) return []
-  const target = matchCase ? query : query.toLocaleLowerCase()
-  const matches = []
-  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-    const row = rows[rowIndex]
-    if (scope && !scope.rowIds.has(row.id)) continue
-    for (let columnIndex = 0; columnIndex < columns.length; columnIndex++) {
-      const column = columns[columnIndex]
-      if (scope && !scope.columnKeys.has(column.key)) continue
-      const raw = getProjectionValue(row, column.key)
-      const value = raw === null || raw === undefined ? '' : String(raw)
-      const candidate = matchCase ? value : value.toLocaleLowerCase()
-      if (entireCell ? candidate === target : candidate.includes(target)) {
-        matches.push({ rowId: row.id, rowIndex, columnKey: column.key, columnLabel: column.label, value })
-        if (matches.length >= limit) return matches
-      }
-    }
-  }
-  return matches
-}
-
-function updateEditableCell(draft, match, value) {
-  const parsed = parseEdit(match.columnKey, value)
-  if (parsed.error) throw new Error(`${match.columnLabel}: ${parsed.error}`)
-  const row = draft.rows.find((item) => item.id === match.rowId)
-  if (!row) throw new Error('A matching row is no longer available.')
-  if (match.columnKey === 'rate') updateWorksheetRowRate(draft, match.rowId, parsed.value)
-  applyParsedEdit(row, match.columnKey, parsed)
-}
-
 function activeFilter(filter = {}) {
   return Boolean(filter.search || filter.condition || filter.selected !== null)
 }
@@ -167,9 +52,12 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
   const preferences=useUiStore((state)=>state.preferences)
   const projectId = useWorkspaceStore((state) => state.project?.id)
   const positionKey = projectId ? gridPositionKey(projectId, sheet.id) : null
-  const restorePosition = readReloadGridPosition(projectId, sheet.id)
+  const mountedPositionKeyRef = useRef(positionKey)
+  const positionUrlRef = useRef(typeof window === 'undefined' ? '' : window.location.href)
+  const restorePosition = readStoredGridPosition(typeof window === 'undefined' ? null : window.sessionStorage, positionKey, positionUrlRef.current)
   const restorePendingRef = useRef(Boolean(restorePosition))
   const positionWriteFrameRef = useRef(null)
+  const scrollPositionRef = useRef({ scrollTop: Number(restorePosition?.scrollTop) || 0, scrollLeft: Number(restorePosition?.scrollLeft) || 0 })
   const parentRef = useRef(null)
   const headerRef = useRef(null)
   const gridRef = useRef(null)
@@ -313,42 +201,12 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
   )
   const rowsById = useMemo(() => new Map(sheet.data.rows.map((row) => [row.id, row])), [sheet.data.rows])
   const boqItemCostSummaries = useMemo(() => summarizeBoqItemCosts(sheet.data.rows), [sheet.data.rows])
+  const firstCqbiByCode = useMemo(() => firstCqbiByBoqCode(sheet.data.rows), [sheet.data.rows])
   const visibleRows = useMemo(() => visibleIds.map((id) => rowsById.get(id)).filter(Boolean), [visibleIds, rowsById])
-  const lastVisibleIndexByCode = useMemo(() => {
-    const result = new Map()
-    visibleRows.forEach((row,index)=>{const code=normalizeBoqCode(row.boqCode);if(code)result.set(code,index)})
-    return result
-  }, [visibleRows])
-  const imageAttachmentsByCode = useMemo(() => {
-    const result = new Map()
-    for(const attachment of imageAttachments){const group=result.get(attachment.boqCode)??[];group.push(attachment);result.set(attachment.boqCode,group)}
-    return result
-  }, [imageAttachments])
-  const rowLayoutSignatures = useMemo(() => {
-    const signatures = new Map()
-    visibleRows.forEach((row, index) => {
-      const code = normalizeBoqCode(row.boqCode)
-      const galleryCount = showImages && lastVisibleIndexByCode.get(code) === index
-        ? imageAttachmentsByCode.get(code)?.length ?? 0
-        : 0
-      signatures.set(row.id, JSON.stringify([row.resource ?? '', galleryCount]))
-    })
-    return signatures
-  }, [visibleRows, showImages, lastVisibleIndexByCode, imageAttachmentsByCode])
-  const visibleBoqGroups = useMemo(() => {
-    const groups = new Map()
-    let previousCode = null
-    let groupIndex = -1
-    visibleRows.forEach((row) => {
-      const code = normalizeBoqCode(row.boqCode)
-      if (!code) { previousCode = null; return }
-      const startsGroup = code !== previousCode
-      if (startsGroup) groupIndex += 1
-      groups.set(row.id, { tone: groupIndex % 2 === 0 ? 'a' : 'b', startsGroup })
-      previousCode = code
-    })
-    return groups
-  }, [visibleRows])
+  const lastVisibleIndexByCode = useMemo(() => indexLastVisibleRows(visibleRows), [visibleRows])
+  const imageAttachmentsByCode = useMemo(() => groupImageAttachments(imageAttachments), [imageAttachments])
+  const rowLayoutSignatures = useMemo(() => getRowLayoutSignatures(visibleRows, showImages, lastVisibleIndexByCode, imageAttachmentsByCode), [visibleRows, showImages, lastVisibleIndexByCode, imageAttachmentsByCode])
+  const visibleBoqGroups = useMemo(() => groupVisibleBoqRows(visibleRows), [visibleRows])
   const tableColumns = useMemo(() => columns.map((column) => ({
     id: column.key,
     accessorFn: (row) => row[column.key],
@@ -386,6 +244,8 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     extentCell: selectionExtent,
   } = useGridInteraction(sheet.id, rowModel, columns, restorePosition)
   const selectionSnapshot = { active, anchor: selectionAnchor, extent: selectionExtent }
+  const selectionSnapshotRef = useRef(selectionSnapshot)
+  selectionSnapshotRef.current = selectionSnapshot
   useEffect(() => {
     if (!assemblyContextMenu) return undefined
     const focusFrame = window.requestAnimationFrame(() => assemblyContextMenuButtonRef.current?.focus())
@@ -398,31 +258,18 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     document.addEventListener('keydown', close, true)
     return () => { window.cancelAnimationFrame(focusFrame); document.removeEventListener('pointerdown', close, true); document.removeEventListener('keydown', close, true) }
   }, [assemblyContextMenu])
-  const selectionSummary = useMemo(() => {
-    if (selectedRowIds.length) return { kind: 'rows', rowCount: selectedRowIds.length }
-    if (!selectionBounds) return null
-    const cellCount = (selectionBounds.bottom - selectionBounds.top + 1) * (selectionBounds.right - selectionBounds.left + 1)
-    if (cellCount <= 1) return null
-    let count = 0
-    let numericCount = 0
-    let sum = 0
-    for (let rowIndex = selectionBounds.top; rowIndex <= selectionBounds.bottom; rowIndex++) {
-      const row = rowModel[rowIndex]?.original
-      if (!row) continue
-      for (let columnIndex = selectionBounds.left; columnIndex <= selectionBounds.right; columnIndex++) {
-        const value = getProjectionValue(row, columns[columnIndex].key)
-        if (value !== null && value !== undefined && !(typeof value === 'string' && value.trim() === '')) count++
-        const parsed = parseNumeric(value)
-        if (!parsed.error && parsed.value !== null) { sum += parsed.value; numericCount++ }
-      }
-    }
-    return { kind: 'cells', count, numericCount, sum, average: numericCount ? sum / numericCount : null }
-  }, [selectedRowIds, selectionBounds, rowModel, columns])
+  const selectionSummary = useMemo(() => getSelectionSummary(selectedRowIds, selectionBounds, rowModel, columns), [selectedRowIds, selectionBounds, rowModel, columns])
   useEffect(() => { onSelectionSummary?.(selectionSummary) }, [onSelectionSummary, selectionSummary])
   const writeGridPosition = useCallback(() => {
     if (restorePendingRef.current) return
-    saveGridPosition(positionKey, window.location.href, selectionSnapshot, parentRef.current)
-  }, [positionKey, active, selectionAnchor, selectionExtent])
+    const scroller = parentRef.current
+    if (scroller) scrollPositionRef.current = { scrollTop: scroller.scrollTop, scrollLeft: scroller.scrollLeft }
+    writeStoredGridPosition(window.sessionStorage, positionKey, {
+      url: positionUrlRef.current,
+      selection: selectionSnapshotRef.current,
+      ...scrollPositionRef.current,
+    })
+  }, [positionKey])
   const scheduleGridPositionWrite = useCallback(() => {
     if (restorePendingRef.current || positionWriteFrameRef.current !== null) return
     positionWriteFrameRef.current = window.requestAnimationFrame(() => {
@@ -431,8 +278,6 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     })
   }, [writeGridPosition])
   useEffect(() => {
-    // This module-level gate is consumed once so later SPA visits never restore an old position.
-    reloadRestorePending = false
     if (!restorePosition) return undefined
     let secondFrame = 0
     const firstFrame = window.requestAnimationFrame(() => {
@@ -442,6 +287,10 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
         if (scroller) {
           scroller.scrollTop = Math.max(0, Number(restorePosition.scrollTop) || 0)
           scroller.scrollLeft = Math.max(0, Number(restorePosition.scrollLeft) || 0)
+        }
+        scrollPositionRef.current = {
+          scrollTop: Math.max(0, Number(restorePosition.scrollTop) || 0),
+          scrollLeft: Math.max(0, Number(restorePosition.scrollLeft) || 0),
         }
         restorePendingRef.current = false
         writeGridPosition()
@@ -456,10 +305,24 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     if (!restorePendingRef.current) writeGridPosition()
   }, [writeGridPosition])
   useEffect(() => {
-    const onPageHide = () => saveGridPosition(positionKey, window.location.href, selectionSnapshot, parentRef.current)
+    const scroller = parentRef.current
+    const saveLatestPosition = () => writeStoredGridPosition(window.sessionStorage, mountedPositionKeyRef.current, {
+      url: positionUrlRef.current,
+      selection: selectionSnapshotRef.current,
+      ...scrollPositionRef.current,
+    })
+    const onPageHide = () => {
+      if (scroller) scrollPositionRef.current = { scrollTop: scroller.scrollTop, scrollLeft: scroller.scrollLeft }
+      saveLatestPosition()
+    }
     window.addEventListener('pagehide', onPageHide)
-    return () => window.removeEventListener('pagehide', onPageHide)
-  }, [positionKey, active, selectionAnchor, selectionExtent])
+    return () => {
+      window.removeEventListener('pagehide', onPageHide)
+      // Preserve the mounted worksheet URL and latest refs; route changes may already have changed location.
+      if (scroller) scrollPositionRef.current = { scrollTop: scroller.scrollTop, scrollLeft: scroller.scrollLeft }
+      saveLatestPosition()
+    }
+  }, [])
   useEffect(() => () => {
     if (positionWriteFrameRef.current !== null) window.cancelAnimationFrame(positionWriteFrameRef.current)
   }, [])
@@ -560,6 +423,22 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     return () => window.removeEventListener('keydown', onFindShortcut)
   }, [openFind])
   useEffect(() => {
+    const onHistoryShortcut = (event) => {
+      if (event.defaultPrevented || event.altKey || !(event.ctrlKey || event.metaKey)) return
+      const key = event.key.toLowerCase()
+      if (key !== 'z' && key !== 'y') return
+
+      const target = event.target
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return
+
+      event.preventDefault()
+      if (key === 'y' || event.shiftKey) redoSheet(sheet.id)
+      else undoSheet(sheet.id)
+    }
+    window.addEventListener('keydown', onHistoryShortcut)
+    return () => window.removeEventListener('keydown', onHistoryShortcut)
+  }, [sheet.id, undoSheet, redoSheet])
+  useEffect(() => {
     if (!findOpen) return undefined
     const frame = window.requestAnimationFrame(() => {
       if (showReplace) replaceInputRef.current?.focus()
@@ -623,7 +502,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     }
   }, [editor?.cell.rowId, editor?.cell.columnKey, editor?.mode, editor?.source])
   useLayoutEffect(() => {
-    if (editorColumnKey !== 'resource' || !(editorRef.current instanceof HTMLTextAreaElement)) return
+    if (!['resource', 'remark'].includes(editorColumnKey) || !(editorRef.current instanceof HTMLTextAreaElement)) return
     const textarea = editorRef.current
     textarea.style.height = 'auto'
     textarea.style.height = `${textarea.scrollHeight}px`
@@ -977,20 +856,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     }
   }, [selectionBounds, rowModel, columns, mutateSheet, sheet.id])
 
-  const getCellClipboardMatrix = useCallback(() => {
-    if (!selectionBounds) return []
-    const matrix = []
-    for (let rowIndex = selectionBounds.top; rowIndex <= selectionBounds.bottom; rowIndex++) {
-      const row = rowModel[rowIndex]?.original
-      if (!row) continue
-      matrix.push(columns.slice(selectionBounds.left, selectionBounds.right + 1)
-        .map((column) => {
-          if (column.key === 'cost' || column.key === 'usedCost' || column.key === 'totalCost') return getRowDerivedValues(row)[column.key] ?? ''
-          return clipboardCellValue(row, column.key)
-        }))
-    }
-    return matrix
-  }, [selectionBounds, rowModel, columns])
+  const getCellClipboardMatrix = useCallback(() => buildCellClipboardMatrix(rowModel, columns, selectionBounds), [selectionBounds, rowModel, columns])
 
   const attachImageFile = useCallback(async (file, boqCode) => {
     try {
@@ -1032,26 +898,14 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     catch(error) { notify(`Could not delete image: ${error.message}`,'error'); return false }
   },[])
 
-  const openImagePreview = useCallback(async (attachment) => {
-    try {
-      const record=await getImageAttachment(attachment.id)
-      if(!record?.blob)throw new Error('The image is no longer available.')
-      setImagePreview({attachment,url:URL.createObjectURL(record.blob)})
-    } catch(error) { notify(`Could not open image: ${error.message}`,'error') }
-  },[])
-
-  useEffect(()=>()=>{if(imagePreview?.url)URL.revokeObjectURL(imagePreview.url)},[imagePreview])
+  const openImagePreview = useCallback((attachment) => setImagePreview(attachment), [])
 
   const onGridCopy = useCallback((event) => {
     if (selectedRowIds.length) {
       const selectedRows = rowModel.filter((row) => selectedRowIdSet.has(row.id))
       const copiedRows = selectedRows.map((tableRow) => tableRow.original)
       rowClipboardRef.current = { rows: copiedRows.map((row) => ({ ...row })) }
-      const matrix = selectedRows.map((tableRow) => columns.map((column) => {
-        const row = tableRow.original
-        return column.key === 'cost' || column.key === 'usedCost' || column.key === 'totalCost'
-          ? getRowDerivedValues(row)[column.key] ?? '' : clipboardCellValue(row, column.key)
-      }))
+      const matrix = buildRowClipboardMatrix(copiedRows, columns)
       if (!matrix.length) return
       event.preventDefault()
       event.clipboardData.setData('text/plain', serializeClipboardMatrix(matrix))
@@ -1074,10 +928,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       const selectedRows = rowModel.filter((row) => selectedRowIdSet.has(row.id)).map((tableRow) => tableRow.original)
       if (!selectedRows.length) return
       if (selectedRows.length * columns.length > FILL_CELL_LIMIT) { event.preventDefault(); notify(`A cut operation cannot exceed ${FILL_CELL_LIMIT.toLocaleString()} cells.`, 'warning'); return }
-      const matrix = selectedRows.map((row) => columns.map((column) => {
-        return column.key === 'cost' || column.key === 'usedCost' || column.key === 'totalCost'
-          ? getRowDerivedValues(row)[column.key] ?? '' : clipboardCellValue(row, column.key)
-      }))
+      const matrix = buildRowClipboardMatrix(selectedRows, columns)
       event.preventDefault()
       rowClipboardRef.current = { rows: selectedRows.map((row) => ({ ...row })) }
       event.clipboardData.setData('text/plain', serializeClipboardMatrix(matrix))
@@ -1104,10 +955,10 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
   const onGridPaste = useCallback((event) => {
     const target=event.target
     if(target instanceof HTMLElement&&target.closest('input,textarea,select,[contenteditable="true"],[role="dialog"]'))return
-    const imageItem=Array.from(event.clipboardData?.items??[]).find((item)=>item.kind==='file'&&item.type.startsWith('image/'))
-    if(imageItem){
+    const clipboard = classifyClipboardPaste(event.clipboardData)
+    if(clipboard.type==='image'){
       event.preventDefault()
-      const file=imageItem.getAsFile()
+      const file=clipboard.imageItem.getAsFile()
       const row=active?rowsById.get(active.rowId):null
       if(!file){notify('The clipboard image could not be read.','error');return}
       if(!row?.boqCode?.trim()){notify('Select a cell in a coded BQ item before pasting an image.','warning');return}
@@ -1115,11 +966,10 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       return
     }
     if (selectedRowIds.length) return
-    const clipboardText = event.clipboardData?.getData('text/plain')
-    if (clipboardText === undefined) return
+    const clipboardText = clipboard.text
     event.preventDefault()
     try {
-      const matrix = clipboardText === '' && cellClipboardRef.current
+      const matrix = clipboard.source === 'empty' && cellClipboardRef.current
         ? cellClipboardRef.current
         : parseClipboardText(clipboardText)
       cellClipboardRef.current = matrix
@@ -1274,7 +1124,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       return
     }
     if (event.target === editorRef.current) {
-      if (editorColumnKey === 'resource' && event.key === 'Enter' && event.altKey) {
+      if (['resource', 'remark'].includes(editorColumnKey) && event.key === 'Enter' && event.altKey) {
         event.stopPropagation()
         return
       }
@@ -1530,9 +1380,15 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
   }
 
   const activeFilterCount = Object.values(filters).filter(activeFilter).length
+  const activeRow = active ? rowsById.get(active.rowId) : null
   const formulaValue = editor && editor.cell.rowId === active?.rowId && editor.cell.columnKey === active?.columnKey
     ? editor.text
-    : active ? editCellText(rowsById.get(active.rowId), active.columnKey) : ''
+    : activeRow && ['cqbi', 'cr', 'rate', 'override', 'boqQty'].includes(active.columnKey)
+      ? activeRow.expressions?.[active.columnKey] ?? formatNumber(activeRow[active.columnKey], {
+        decimals: active.columnKey === 'boqQty' ? preferences?.quantityDecimals : INPUT_NUMBER_DISPLAY_DECIMALS,
+        useGrouping: preferences?.useGrouping,
+      })
+      : active ? editCellText(activeRow, active.columnKey) : ''
   const formulaEditorProps = {
     'aria-label': 'Formula bar',
     value: formulaValue,
@@ -1544,7 +1400,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     },
     onBlur: () => { if (editor) commit() },
     onKeyDown: (event) => {
-      if (active?.columnKey === 'resource' && event.key === 'Enter' && event.altKey) { event.stopPropagation(); return }
+      if (['resource', 'remark'].includes(active?.columnKey) && event.key === 'Enter' && event.altKey) { event.stopPropagation(); return }
       if (!event.ctrlKey && !event.metaKey && !event.altKey && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
         event.preventDefault()
         const deltas = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }
@@ -1559,7 +1415,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
     <input ref={imageFileInputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" onChange={onImageFileChange} aria-label="Choose image to attach to BQ item" />
     <div className="formula-bar">
       <label>Name box<input aria-label="Active cell address" readOnly value={active ? `${columns[activeColumnIndex]?.letter ?? ''}${activeRowIndex + 1}` : ''} /></label>
-      {active?.columnKey === 'resource'
+      {['resource', 'remark'].includes(active?.columnKey)
         ? <textarea className="formula-resource-editor" title="Alt+Enter inserts a line break · Enter commits" rows={Math.min(4, Math.max(1, formulaValue.split('\n').length))} {...formulaEditorProps} />
         : <input {...formulaEditorProps} />}
       {error && <span role="alert">{error}</span>}
@@ -1615,6 +1471,7 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       }))}
     </div>
     <div className="grid-scroll" ref={parentRef} onScroll={(event) => {
+      scrollPositionRef.current = { scrollTop: event.currentTarget.scrollTop, scrollLeft: event.currentTarget.scrollLeft }
       setAssemblyContextMenu(null)
       hoveredBoqCodeRef.current = ''
       if (resourceShortcutSequenceRef.current?.timeout) clearTimeout(resourceShortcutSequenceRef.current.timeout)
@@ -1692,14 +1549,14 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
                 key={cell.id}
                 data-grid-row-index={virtualRow.index}
                 data-grid-column-index={visibleColumnIndex}
-                  className={`${column.derived ? 'derived-cell ' : ''}${column.key === 'resource' ? 'resource-cell ' : ''}${isActive ? 'active-cell ' : ''}${selected(row.id, column.key) ? 'selected-cell ' : ''}${isFindMatch ? 'find-hit ' : ''}${isCurrentFindMatch ? 'find-hit-current ' : ''}${inFillPreview ? 'fill-preview-cell ' : ''}${column.key === 'boqCode' && group ? 'boq-code-cell' : ''}`}
+                   className={`${column.derived ? 'derived-cell ' : ''}${['resource', 'remark'].includes(column.key) ? 'multiline-cell ' : ''}${isActive ? 'active-cell ' : ''}${selected(row.id, column.key) ? 'selected-cell ' : ''}${isFindMatch ? 'find-hit ' : ''}${isCurrentFindMatch ? 'find-hit-current ' : ''}${inFillPreview ? 'fill-preview-cell ' : ''}${column.key === 'boqCode' && group ? 'boq-code-cell' : ''}`}
                   title={column.key === 'totalCost' ? 'Hover for BQ item cost summary' : column.derived ? 'Calculated value' : undefined}
                   onPointerMove={(event) => {
                    if (column.key !== 'totalCost' || !costSummaryTooltip) return
                    setCostSummaryTooltip((current) => current ? {
                      ...current,
                      left: Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 248)),
-                     top: Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 132)),
+                      top: Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 160)),
                    } : current)
                  }}
                  onPointerLeave={() => { if (column.key === 'totalCost') setCostSummaryTooltip(null) }}
@@ -1728,8 +1585,13 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
                      const summary = boqItemCostSummaries.get(code)
                      if (summary) {
                        const left = Math.max(8, Math.min(event.clientX + 14, window.innerWidth - 248))
-                       const top = Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 132))
-                       setCostSummaryTooltip({ ...summary, left, top })
+                        const top = Math.max(8, Math.min(event.clientY + 14, window.innerHeight - 160))
+                      setCostSummaryTooltip({
+                        ...summary,
+                        unitCostPerCqbi: unitCostPerCqbi(summary.unitCost, firstCqbiByCode.get(code)),
+                        left,
+                        top,
+                      })
                      }
                    }
                    if (!dragSelectionRef.current || event.buttons !== 1) return
@@ -1745,8 +1607,8 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
               >
                 {editor?.cell.rowId === row.id && editor?.cell.columnKey === column.key
                   ? <>
-                    {column.key === 'resource'
-                      ? <textarea ref={editorRef} className="cell-editor resource-cell-editor" title="Alt+Enter inserts a line break · Enter commits" rows={Math.max(1, editor.text.split('\n').length)} aria-label={`Edit ${column.label}, row ${virtualRow.index + 1}`} aria-invalid={Boolean(error)} aria-describedby={error ? 'grid-edit-error' : undefined} value={editor.text} onChange={(event) => { setEditor({ ...editor, text: event.target.value }); setError(''); setActiveSuggestion(-1) }} onBlur={() => commit()} onKeyDown={onGridKeyDown} />
+                     {['resource', 'remark'].includes(column.key)
+                       ? <textarea ref={editorRef} className="cell-editor multiline-cell-editor" title="Alt+Enter inserts a line break · Enter commits" rows={Math.max(1, editor.text.split('\n').length)} aria-label={`Edit ${column.label}, row ${virtualRow.index + 1}`} aria-invalid={Boolean(error)} aria-describedby={error ? 'grid-edit-error' : undefined} value={editor.text} onChange={(event) => { setEditor({ ...editor, text: event.target.value }); setError(''); setActiveSuggestion(-1) }} onBlur={() => commit()} onKeyDown={onGridKeyDown} />
                        : <input ref={editorRef} className="cell-editor" autoComplete="off" aria-autocomplete={suggestionValues.length ? 'list' : undefined} aria-controls={suggestionValues.length ? 'cell-suggestion-list' : undefined} aria-expanded={Boolean(suggestionValues.length)} aria-label={`Edit ${column.label}, row ${virtualRow.index + 1}`} aria-invalid={Boolean(error)} aria-describedby={error ? 'grid-edit-error' : undefined} value={editor.text} onChange={(event) => { setEditor({ ...editor, text: event.target.value }); setError(''); setActiveSuggestion(-1) }} onBlur={() => commit()} onKeyDown={onGridKeyDown} />}
                   </>
                     : <>{valueFor(row.original, column.key,preferences)}{column.key === 'usedCost' && row.original.override !== null && <small> overridden</small>}</>}
@@ -1761,15 +1623,18 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       </div>
       {!sheet.data.rows.length && <div className="cost-grid-empty" role="status"><strong>No BOQ items yet</strong><span>Add a row or import an Excel Cost Load to get started.</span></div>}
       </div>
-      {imagePreview&&<Modal title={`${imagePreview.attachment.boqCode} · Image ${imagePreview.attachment.position+1}`} onClose={()=>setImagePreview(null)}>
-        <div className="boq-image-preview"><img src={imagePreview.url} alt={`Detail image for ${imagePreview.attachment.boqCode}`} /></div>
-        <footer className="modal-actions"><button type="button" className="danger-button" onClick={()=>{setImageDeleteTarget(imagePreview.attachment);setImagePreview(null)}}>Delete image</button><button type="button" className="secondary-button" onClick={()=>setImagePreview(null)}>Close</button></footer>
-      </Modal>}
+      {imagePreview&&<BoqImagePreview
+        attachment={imagePreview}
+        attachments={imageAttachmentsByCode.get(imagePreview.boqCode) ?? [imagePreview]}
+        onClose={()=>setImagePreview(null)}
+        onDeleteRequest={(attachment)=>{setImageDeleteTarget(attachment);setImagePreview(null)}}
+      />}
       {imageDeleteTarget&&<ConfirmDialog title="Delete attached image?" danger confirmLabel="Delete image" onClose={()=>setImageDeleteTarget(null)} onConfirm={async()=>{if(await onDeleteImage(imageDeleteTarget.id))setImageDeleteTarget(null)}}>This removes the image from BQ item <strong>{imageDeleteTarget.boqCode}</strong>.</ConfirmDialog>}
     {costSummaryTooltip && createPortal(<div className="boq-cost-summary-tooltip" role="tooltip" style={{ left: costSummaryTooltip.left, top: costSummaryTooltip.top }}>
       <strong className="boq-cost-summary-code">{costSummaryTooltip.code}</strong>
       <span><small>Unit Cost</small><b>{formatNumber(costSummaryTooltip.unitCost, { decimals: preferences?.costDecimals, useGrouping: preferences?.useGrouping }) || '—'}{preferences?.currencyLabel ? ` ${preferences.currencyLabel}` : ''}</b></span>
-     <span><small>Total Cost</small><b>{formatNumber(costSummaryTooltip.totalCost, { decimals: preferences?.costDecimals, useGrouping: preferences?.useGrouping }) || '—'}{preferences?.currencyLabel ? ` ${preferences.currencyLabel}` : ''}</b></span>
+      <span><small>Total Cost</small><b>{formatNumber(costSummaryTooltip.totalCost, { decimals: preferences?.costDecimals, useGrouping: preferences?.useGrouping }) || '—'}{preferences?.currencyLabel ? ` ${preferences.currencyLabel}` : ''}</b></span>
+      <span><small>Unit Cost / CQBI</small><b>{formatNumber(costSummaryTooltip.unitCostPerCqbi, { decimals: preferences?.costDecimals, useGrouping: preferences?.useGrouping }) || '—'}{preferences?.currencyLabel ? ` ${preferences.currencyLabel}` : ''}</b></span>
      </div>, document.body)}
      {assemblyContextMenu && createPortal(<div className="assembly-context-menu" role="menu" style={{ left: Math.min(assemblyContextMenu.x, window.innerWidth - 250), top: Math.min(assemblyContextMenu.y, window.innerHeight - 70) }}>
        <button ref={assemblyContextMenuButtonRef} type="button" role="menuitem" disabled={!assemblyContextMenu.boqCode || !onRequestSaveAssembly} onClick={() => { const request = { sheetId: sheet.id, boqCode: assemblyContextMenu.boqCode }; setAssemblyContextMenu(null); onRequestSaveAssembly?.(request) }}>Save BOQ item as assembly</button>
@@ -1783,178 +1648,17 @@ export function CostGrid({ sheet, showHistoryControls = true, actionsRef, onSele
       </div>
       <div className="cell-suggestion-hint"><kbd>↑</kbd><kbd>↓</kbd> Navigate <span>·</span> <kbd>Enter</kbd> Use suggestion</div>
     </div>, document.body)}
-    {findOpen && <Modal title="Find & Replace" onClose={closeFind}>
-      <div className="modal-body find-replace-content">
-        <label className="find-replace-field"><span className="find-field-caption">Find in worksheet</span>
-          <div className="find-input-wrap"><Search aria-hidden="true" /><input ref={findInputRef} type="search" value={findText} placeholder="Type a word, code, or value…" aria-label="Find in worksheet" onChange={(event) => { setFindText(event.target.value); setCurrentFindIndex(-1); setFindMessage('') }} onKeyDown={(event) => {
-            if (event.key === 'Enter') { event.preventDefault(); goToFindMatch(event.shiftKey ? -1 : 1) }
-          }} />
-            {findText.trim() && <span className="find-result-count">{currentFindIndex >= 0 && findMatches.length ? currentFindIndex + 1 : 0} / {findMatches.length}</span>}
-            <button type="button" className="find-input-nav" aria-label="Previous match" title="Previous match (Shift+Enter)" onClick={() => goToFindMatch(-1)} disabled={!findText.trim()}><ArrowUp /></button>
-            <button type="button" className="find-input-nav" aria-label="Next match" title="Next match (Enter)" onClick={() => goToFindMatch(1)} disabled={!findText.trim()}><ArrowDown /></button>
-          </div>
-        </label>
-        {showReplace && <label className="find-replace-field replace-field"><span className="find-field-caption">Replace with</span>
-          <div className="find-input-wrap replace-input-wrap"><input ref={replaceInputRef} type="text" value={replaceWith} placeholder="Enter replacement text…" aria-label="Replace with" onChange={(event) => setReplaceWith(event.target.value)} onKeyDown={(event) => {
-            if (event.key === 'Enter') { event.preventDefault(); replaceCurrentMatch() }
-          }} /></div>
-        </label>}
-        <div className="find-replace-meta" aria-live="polite">
-          <div className="find-match-summary"><span className="find-match-label">Matches</span><span className="find-match-count">{findText.trim() ? findMatchCount : '—'}</span><span className="find-match-context">{findText.trim() ? (findMatchCount === 1 ? 'result' : 'results') : 'Ready to search'}</span><span className="find-scope-label">{findSelectionOnly ? 'Current selection' : 'Visible cells'}</span>{findMatchCount > 500 && <small>First 500 results available for navigation</small>}</div>
-          <div className="find-options" role="group" aria-label="Search options">
-            <label className="find-option-chip"><input type="checkbox" checked={findMatchCase} onChange={(event) => { setFindMatchCase(event.target.checked); setCurrentFindIndex(-1) }} /><span>Match case</span></label>
-            <label className="find-option-chip"><input type="checkbox" checked={findEntireCell} onChange={(event) => { setFindEntireCell(event.target.checked); setCurrentFindIndex(-1) }} /><span>Entire cell</span></label>
-            <label className={`find-option-chip${findSelectionOnly ? ' is-active' : ''}`}><input type="checkbox" checked={findSelectionOnly} disabled={!findSelectionOnly && !findSelectionCandidate} onChange={(event) => setFindSelectionScope(event.target.checked)} /><span>Current selection</span></label>
-          </div>
-          <button type="button" className={`find-toggle-replace${showReplace ? ' is-open' : ''}`} aria-expanded={showReplace} onClick={() => setShowReplace((visible) => !visible)}><span>{showReplace ? 'Hide replace controls' : 'Replace matches'}</span><kbd>Ctrl+H</kbd><span className="find-toggle-indicator" aria-hidden="true">{showReplace ? '−' : '+'}</span></button>
-        </div>
-        {currentFindIndex >= 0 && findMatches[currentFindIndex] && <p className="find-replace-location"><span>Current result</span><strong>{currentFindIndex + 1} of {findMatchCount}</strong><span>{findMatches[currentFindIndex].columnLabel}</span><span>Row {findMatches[currentFindIndex].rowIndex + 1}</span></p>}
-        {findMessage && <p className="find-replace-message" role="status">{findMessage}</p>}
-        <div className="find-replace-actions">
-          {!showReplace && <span className="find-keyboard-hint"><kbd>Enter</kbd> next <span>·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> previous</span>}
-          <span className="find-actions-spacer" />
-          {showReplace && <>
-            <button type="button" className="secondary-button" onClick={replaceCurrentMatch} disabled={!findText.trim() || !findMatches.length}>Replace</button>
-            <button type="button" className="primary-button" onClick={replaceAllMatches} disabled={!findText.trim() || !findMatches.length}>Replace all</button>
-          </>}
-        </div>
-      </div>
-    </Modal>}
+     {findOpen && <FindReplaceDialog
+       onClose={closeFind} findInputRef={findInputRef} replaceInputRef={replaceInputRef}
+       findText={findText} onFindTextChange={(event) => { setFindText(event.target.value); setCurrentFindIndex(-1); setFindMessage('') }}
+       currentFindIndex={currentFindIndex} findMatches={findMatches} goToFindMatch={goToFindMatch}
+       showReplace={showReplace} replaceWith={replaceWith} onReplaceWithChange={(event) => setReplaceWith(event.target.value)}
+       replaceCurrentMatch={replaceCurrentMatch} replaceAllMatches={replaceAllMatches} findMatchCount={findMatchCount}
+       findSelectionOnly={findSelectionOnly} findMatchCase={findMatchCase} onMatchCaseChange={(event) => { setFindMatchCase(event.target.checked); setCurrentFindIndex(-1) }}
+       findEntireCell={findEntireCell} onEntireCellChange={(event) => { setFindEntireCell(event.target.checked); setCurrentFindIndex(-1) }}
+       findSelectionCandidate={findSelectionCandidate} setFindSelectionScope={setFindSelectionScope}
+       onToggleReplace={() => setShowReplace((visible) => !visible)} findMessage={findMessage}
+     />}
     <div id="grid-edit-error" className="grid-status" aria-live="polite">{error || status || `${rowModel.length.toLocaleString()} rows`}</div>
   </div>
-}
-
-export function FilterMenu({ column, rows, currentFilter, sortDirection, hasSort, onApply, onClear, onSort, onClose, triggerElement }) {
-  const rootRef = useRef(null)
-  const searchInputRef = useRef(null)
-  const [position, setPosition] = useState({ left: 12, top: 90, maxHeight: 480 })
-  const numeric = isNumericFilterColumn(column.key)
-  const [draft, setDraft] = useState(() => ({ ...DEFAULT_FILTER, ...currentFilter, selected: currentFilter.selected === null ? null : [...currentFilter.selected] }))
-  const [valueSearch, setValueSearch] = useState('')
-  const [selectedOnly, setSelectedOnly] = useState(false)
-  const [advancedOpen, setAdvancedOpen] = useState(Boolean(currentFilter.condition || currentFilter.search))
-  const [conditionError, setConditionError] = useState('')
-  const applyRef = useRef(null)
-  const values = useMemo(() => [...new Set(rows.map((row) => String(getProjectionValue(row, column.key) ?? '')))]
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })), [rows, column.key])
-  const searchedValues = values.filter((value) => (value || '(Blanks)').toLocaleLowerCase().includes(valueSearch.trim().toLocaleLowerCase()))
-  const selectedSet = draft.selected === null ? new Set(values) : new Set(draft.selected)
-  const displayedValues = searchedValues.filter((value) => !selectedOnly || selectedSet.has(value)).slice(0, 200)
-   const allDisplayedSelected = displayedValues.length > 0 && displayedValues.every((value) => selectedSet.has(value))
-  const selectedCount = values.filter((value) => selectedSet.has(value)).length
-
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => searchInputRef.current?.focus())
-    return () => window.cancelAnimationFrame(frame)
-  }, [])
-
-  useLayoutEffect(() => {
-    const updatePosition = () => {
-      const rect = triggerElement?.getBoundingClientRect()
-      if (!rect) return
-      const width = Math.min(330, window.innerWidth - 24)
-      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))
-      const availableBelow = Math.max(0, window.innerHeight - rect.bottom - 12)
-      const availableAbove = Math.max(0, rect.top - 12)
-      const placeAbove = availableBelow < 360 && availableAbove > availableBelow
-      const maxHeight = Math.max(140, Math.min(500, (placeAbove ? availableAbove : Math.max(availableBelow, window.innerHeight - 24)) - 4))
-      const top = placeAbove ? Math.max(8, rect.top - Math.min(maxHeight, 500) - 4) : Math.min(rect.bottom + 4, window.innerHeight - maxHeight - 8)
-      setPosition({ left, top, maxHeight })
-    }
-    updatePosition()
-    window.addEventListener('resize', updatePosition)
-    window.addEventListener('scroll', updatePosition, true)
-    return () => {
-      window.removeEventListener('resize', updatePosition)
-      window.removeEventListener('scroll', updatePosition, true)
-    }
-  }, [triggerElement])
-
-  useEffect(() => {
-    const onPointerDown = (event) => { if (!rootRef.current?.contains(event.target) && !triggerElement?.contains(event.target)) onClose() }
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape') { event.stopPropagation(); onClose(); triggerElement?.focus() }
-      if (event.key === 'Enter' && event.target instanceof HTMLElement && event.target.tagName !== 'BUTTON' && event.target.tagName !== 'SELECT') { event.preventDefault(); applyRef.current?.() }
-    }
-    document.addEventListener('pointerdown', onPointerDown)
-    document.addEventListener('keydown', onKeyDown)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown)
-      document.removeEventListener('keydown', onKeyDown)
-    }
-  }, [onClose, triggerElement])
-
-  const updateDraft = (updates) => setDraft((current) => ({ ...current, ...updates }))
-  const toggleValue = (value) => {
-    const next = new Set(selectedSet)
-    if (next.has(value)) next.delete(value)
-    else next.add(value)
-    updateDraft({ selected: next.size === values.length ? null : [...next] })
-  }
-  const toggleDisplayedValues = () => {
-    const next = new Set(selectedSet)
-     if (allDisplayedSelected) displayedValues.forEach((value) => next.delete(value))
-     else displayedValues.forEach((value) => next.add(value))
-    updateDraft({ selected: next.size === values.length ? null : [...next] })
-  }
-  const selectAllValues = (selectAll) => updateDraft({ selected: selectAll ? null : [] })
-  const apply = useCallback(() => {
-    if (numeric && !['', 'isBlank', 'isNotBlank'].includes(draft.condition)) {
-      const first = parseNumeric(draft.conditionValue)
-      const second = parseNumeric(draft.conditionValue2)
-      if (first.error || first.value === null || (draft.condition === 'between' && (second.error || second.value === null))) {
-        setConditionError('Enter valid numeric condition values.')
-        return
-      }
-    }
-    setConditionError('')
-    onApply(draft)
-  }, [numeric, draft, onApply])
-    useEffect(() => { applyRef.current = apply }, [apply])
-
-  const appShell = document.querySelector('.app-shell')
-  const themeClass = appShell?.classList.contains('theme-dark') ? ' theme-dark' : appShell?.classList.contains('theme-warm') ? ' theme-warm' : ''
-  return createPortal(<div className={`filter-menu${themeClass}`} role="dialog" aria-label={`${column.label} filter`} ref={rootRef} style={position} onClick={(event) => event.stopPropagation()}>
-    <div className="filter-menu-heading"><div className="filter-title"><span>FILTER BY</span><strong>{column.label}</strong></div><button type="button" aria-label="Close filter" onClick={() => { onClose(); triggerElement?.focus() }}><X /></button></div>
-    <div className="filter-sort-actions" aria-label="Sort values">
-      <button type="button" aria-pressed={sortDirection === 'asc'} title={numeric ? 'Smallest to largest' : 'Sort A to Z'} onClick={() => onSort('asc')}><ArrowUpAZ /><span>{numeric ? 'Smallest first' : 'A to Z'}</span></button>
-      <button type="button" aria-pressed={sortDirection === 'desc'} title={numeric ? 'Largest to smallest' : 'Sort Z to A'} onClick={() => onSort('desc')}><ArrowDownAZ /><span>{numeric ? 'Largest first' : 'Z to A'}</span></button>
-      {hasSort && <button type="button" className="filter-sort-reset" onClick={() => onSort(null)} title="Restore original order">Reset</button>}
-    </div>
-    <label className="filter-field-label filter-value-search">Search values<input ref={searchInputRef} type="search" value={valueSearch} onChange={(event) => setValueSearch(event.target.value)} placeholder="Type to find a value…" /></label>
-    <div className="filter-selection-tools">
-      <label className="filter-select-visible"><input type="checkbox" checked={allDisplayedSelected} onChange={toggleDisplayedValues} /> Select visible</label>
-      <div><button type="button" onClick={() => selectAllValues(true)}>All</button><button type="button" onClick={() => selectAllValues(false)}>None</button></div>
-    </div>
-    <div className="filter-values-heading"><span>{selectedCount} of {values.length} selected · showing {displayedValues.length} of {searchedValues.length}</span><label><input type="checkbox" checked={selectedOnly} onChange={(event) => setSelectedOnly(event.target.checked)} /> Selected only</label></div>
-    <div className="filter-values-list" role="group" aria-label={`${column.label} values`}>
-      {displayedValues.length ? displayedValues.map((value) => <label key={value} title={value || 'Blank value'}>
-        <input type="checkbox" checked={selectedSet.has(value)} onChange={() => toggleValue(value)} />
-        <span>{value || '(Blanks)'}</span>
-      </label>) : <p className="filter-no-values">{selectedOnly ? 'No selected values match this search.' : 'No matching values.'}</p>}
-    </div>
-    <div className={`filter-advanced${advancedOpen ? ' is-open' : ''}`}>
-      <button type="button" className="filter-advanced-toggle" aria-expanded={advancedOpen} onClick={() => setAdvancedOpen((open) => !open)}><span>Advanced filter</span><small>{draft.condition || draft.search ? 'Active' : 'Optional'}</small><span className="filter-advanced-chevron">⌄</span></button>
-      {advancedOpen && <div className="filter-advanced-content">
-        <div className="filter-condition">
-          <label className="filter-field-label">{numeric ? 'Number condition' : 'Text condition'}
-            <select value={draft.condition} onChange={(event) => updateDraft({ condition: event.target.value, conditionValue: '', conditionValue2: '' })}>
-              <option value="">No condition</option>
-              {(numeric ? numberConditions : textConditions).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-            </select>
-          </label>
-          {draft.condition && !['isBlank', 'isNotBlank'].includes(draft.condition) && <div className="filter-condition-inputs">
-            <input aria-label="Filter condition value" type="text" inputMode={numeric ? 'decimal' : 'text'} value={draft.conditionValue} onChange={(event) => updateDraft({ conditionValue: event.target.value })} placeholder="Value" />
-            {draft.condition === 'between' && <input aria-label="Filter condition upper value" type="text" inputMode="decimal" value={draft.conditionValue2} onChange={(event) => updateDraft({ conditionValue2: event.target.value })} placeholder="And" />}
-          </div>}
-          {conditionError && <p className="filter-condition-error" role="alert">{conditionError}</p>}
-        </div>
-        <label className="filter-field-label filter-text-search">Filter rows containing<input type="search" value={draft.search} onChange={(event) => updateDraft({ search: event.target.value })} placeholder={`Text in ${column.label}`} /></label>
-      </div>}
-    </div>
-    <div className="filter-menu-footer">
-      <button type="button" className="filter-clear" onClick={() => { setDraft({ ...DEFAULT_FILTER }); setValueSearch(''); setConditionError(''); onClear() }}>Clear filter</button>
-      <button type="button" className="filter-apply" onClick={apply}><Check /> Apply</button>
-    </div>
-  </div>, document.body)
 }

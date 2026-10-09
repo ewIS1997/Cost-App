@@ -211,7 +211,7 @@ function indexHeaders(headers) {
 
 function readText(row, index, field) {
   if (index === undefined || index < 0 || isBlank(row[index])) return ''
-  const value = field === 'resource' ? normalizeResourceText(row[index]) : normalizeText(row[index])
+  const value = field === 'resource' || field === 'remark' ? normalizeResourceText(row[index]) : normalizeText(row[index])
   const parsed = field === 'boqCode' ? normalizeBoqCode(value) : value
   return parsed
 }

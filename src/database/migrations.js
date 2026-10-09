@@ -2,6 +2,7 @@ import { APP_FONT_FAMILIES, createAppSettings, createBlankRow, createBlankWorksh
 import { DEFAULT_COLUMN_WIDTHS, DEFAULT_FILTER } from '../domain/constants.js'
 import { validateAllProjectsBackup, validateProjectBackup, validateProject, validateWorksheet } from '../domain/validation.js'
 
+// Stored worksheet, app settings and JSON backup versions evolve independently.
 function addUnitColumnShape(worksheet) {
   if (Array.isArray(worksheet.columnWidths) && worksheet.columnWidths.length === DEFAULT_COLUMN_WIDTHS.length - 1) {
     worksheet.columnWidths = [...worksheet.columnWidths.slice(0, 3), DEFAULT_COLUMN_WIDTHS[3], ...worksheet.columnWidths.slice(3)]

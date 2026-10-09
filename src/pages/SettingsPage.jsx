@@ -20,14 +20,139 @@ const fontChoices = [
 ].filter((font) => APP_FONT_FAMILIES.includes(font.value))
 
 export function SettingsPage() {
-  const navigate=useNavigate(); const inputRef=useRef(null); const settingsRef=useRef(null); const settingsWriteQueue=useRef(createAsyncWriteQueue()); const settingsWriteRevision=useRef(0); const failedSettingsWrite=useRef(null); const [settings,setSettings]=useState(null); const [error,setError]=useState(''); const [restore,setRestore]=useState(null); const [deleteStep,setDeleteStep]=useState(0); const [working,setWorking]=useState(false)
-  const project=useWorkspaceStore((state)=>state.project); const setPreferences=useUiStore((state)=>state.setPreferences)
-  useEffect(()=>{let live=true;readSettings().then((value)=>{if(live){settingsRef.current=value;setSettings(value);setPreferences(value)}}).catch((reason)=>{if(live)setError(reason.message)});return()=>{live=false}},[setPreferences])
-  const update=(key,value)=>{const current=settingsRef.current;if(!current)return;const revision=++settingsWriteRevision.current;const next={...current,[key]:value};settingsRef.current=next;setSettings(next);setPreferences(next);const pending=settingsWriteQueue.current.enqueue(async()=>{try{await writeSettings(next);failedSettingsWrite.current=null;window.dispatchEvent(new Event('boq-settings-updated'))}catch(reason){failedSettingsWrite.current=reason;try{const persisted=await readSettings();if(revision===settingsWriteRevision.current){settingsRef.current=persisted;setSettings(persisted);setPreferences(persisted)}}catch{/* Keep the original write failure as the actionable error. */}throw reason}});pending.catch((reason)=>notify(`Could not save preference: ${reason.message}`,'error'));return pending}
-  const exportBackup=async()=>{setWorking(true);try{await settingsWriteQueue.current.idle();if(failedSettingsWrite.current)throw new Error(`A preference change could not be saved: ${failedSettingsWrite.current.message}`);const snapshot=await exportAllProjectsSnapshot();const backup={backupType:'boq-cost-load-all-projects',schemaVersion:1,exportedAt:new Date().toISOString(),...snapshot};const json=serializeBackupWithinLimit(backup,JSON_BACKUP_LIMIT);const url=URL.createObjectURL(new Blob([json],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download=`boq-cost-load-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);notify('Full workspace backup downloaded.')}catch(reason){notify(`Backup export failed: ${reason.message}`,'error')}finally{setWorking(false)}}
-   const chooseRestore=async(event)=>{const file=event.target.files?.[0];event.target.value='';if(!file)return;if(file.size>JSON_BACKUP_LIMIT){notify(`Backup must be ${Math.floor(JSON_BACKUP_LIMIT/1024/1024)} MB or smaller.`,'error');return}setWorking(true);try{const parsed=JSON.parse(await file.text());const migrated=migrateBackup(parsed);if(migrated.backupType!=='boq-cost-load-all-projects')throw new Error('Choose a full workspace backup exported from Settings.');const backup={...migrated,settings:migrateAppSettings(migrated.settings)};const errors=validateAllProjectsBackup(backup);if(errors.length)throw new Error(errors[0]);setRestore({backup,fileName:file.name})}catch(reason){notify(`Backup could not be opened: ${reason.message}`,'error')}finally{setWorking(false)}}
-  const confirmRestore=async()=>{if(!restore)return;setWorking(true);try{await settingsWriteQueue.current.idle();await useWorkspaceStore.getState().guardNavigation();await replaceAllProjects(restore.backup);useWorkspaceStore.getState().clear();settingsRef.current=restore.backup.settings;setPreferences(restore.backup.settings);setSettings(restore.backup.settings);failedSettingsWrite.current=null;setRestore(null);window.dispatchEvent(new Event('boq-settings-updated'));notify('Workspace restored.');navigate('/projects')}catch(reason){notify(`Restore failed: ${reason.message}`,'error')}finally{setWorking(false)}}
-  const confirmDelete=async()=>{setWorking(true);try{await settingsWriteQueue.current.idle();await useWorkspaceStore.getState().guardNavigation();await deleteAllLocalData();useWorkspaceStore.getState().clear();const defaults=createAppSettings();settingsRef.current=defaults;setSettings(defaults);setPreferences(defaults);failedSettingsWrite.current=null;setDeleteStep(0);window.dispatchEvent(new Event('boq-settings-updated'));notify('All local application data was deleted.');navigate('/projects')}catch(reason){notify(`Could not delete local data: ${reason.message}`,'error')}finally{setWorking(false)}}
+  const navigate = useNavigate()
+  const inputRef = useRef(null)
+  const settingsRef = useRef(null)
+  const settingsWriteQueue = useRef(createAsyncWriteQueue())
+  const settingsWriteRevision = useRef(0)
+  const failedSettingsWrite = useRef(null)
+  const [settings, setSettings] = useState(null)
+  const [error, setError] = useState('')
+  const [restore, setRestore] = useState(null)
+  const [deleteStep, setDeleteStep] = useState(0)
+  const [working, setWorking] = useState(false)
+  const project = useWorkspaceStore((state) => state.project)
+  const setPreferences = useUiStore((state) => state.setPreferences)
+  useEffect(() => {
+    let live = true
+    readSettings().then((value) => {
+      if (live) {
+        settingsRef.current = value
+        setSettings(value)
+        setPreferences(value)
+      }
+    }).catch((reason) => { if (live) setError(reason.message) })
+    return () => { live = false }
+  }, [setPreferences])
+  const update = (key, value) => {
+    const current = settingsRef.current
+    if (!current) return
+    const revision = ++settingsWriteRevision.current
+    const next = { ...current, [key]: value }
+    settingsRef.current = next
+    setSettings(next)
+    setPreferences(next)
+    const pending = settingsWriteQueue.current.enqueue(async () => {
+      try {
+        await writeSettings(next)
+        failedSettingsWrite.current = null
+        window.dispatchEvent(new Event('boq-settings-updated'))
+      } catch (reason) {
+        failedSettingsWrite.current = reason
+        try {
+          const persisted = await readSettings()
+          if (revision === settingsWriteRevision.current) {
+            settingsRef.current = persisted
+            setSettings(persisted)
+            setPreferences(persisted)
+          }
+        } catch { /* Keep the original write failure as the actionable error. */ }
+        throw reason
+      }
+    })
+    pending.catch((reason) => notify(`Could not save preference: ${reason.message}`, 'error'))
+    return pending
+  }
+  const exportBackup = async () => {
+    setWorking(true)
+    try {
+      await settingsWriteQueue.current.idle()
+      if (failedSettingsWrite.current) throw new Error(`A preference change could not be saved: ${failedSettingsWrite.current.message}`)
+      const snapshot = await exportAllProjectsSnapshot()
+      const backup = { backupType: 'boq-cost-load-all-projects', schemaVersion: 1, exportedAt: new Date().toISOString(), ...snapshot }
+      const json = serializeBackupWithinLimit(backup, JSON_BACKUP_LIMIT)
+      const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `boq-cost-load-backup-${new Date().toISOString().slice(0,10)}.json`
+      link.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      notify('Full workspace backup downloaded.')
+    } catch (reason) {
+      notify(`Backup export failed: ${reason.message}`, 'error')
+    } finally { setWorking(false) }
+  }
+  const chooseRestore = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (file.size > JSON_BACKUP_LIMIT) {
+      notify(`Backup must be ${Math.floor(JSON_BACKUP_LIMIT/1024/1024)} MB or smaller.`, 'error')
+      return
+    }
+    setWorking(true)
+    try {
+      const parsed = JSON.parse(await file.text())
+      const migrated = migrateBackup(parsed)
+      if (migrated.backupType !== 'boq-cost-load-all-projects') throw new Error('Choose a full workspace backup exported from Settings.')
+      const backup = { ...migrated, settings: migrateAppSettings(migrated.settings) }
+      const errors = validateAllProjectsBackup(backup)
+      if (errors.length) throw new Error(errors[0])
+      setRestore({ backup, fileName: file.name })
+    } catch (reason) {
+      notify(`Backup could not be opened: ${reason.message}`, 'error')
+    } finally { setWorking(false) }
+  }
+  const confirmRestore = async () => {
+    if (!restore) return
+    setWorking(true)
+    try {
+      await settingsWriteQueue.current.idle()
+      await useWorkspaceStore.getState().guardNavigation()
+      await replaceAllProjects(restore.backup)
+      useWorkspaceStore.getState().clear()
+      settingsRef.current = restore.backup.settings
+      setPreferences(restore.backup.settings)
+      setSettings(restore.backup.settings)
+      failedSettingsWrite.current = null
+      setRestore(null)
+      window.dispatchEvent(new Event('boq-settings-updated'))
+      notify('Workspace restored.')
+      navigate('/projects')
+    } catch (reason) {
+      notify(`Restore failed: ${reason.message}`, 'error')
+    } finally { setWorking(false) }
+  }
+  const confirmDelete = async () => {
+    setWorking(true)
+    try {
+      await settingsWriteQueue.current.idle()
+      await useWorkspaceStore.getState().guardNavigation()
+      await deleteAllLocalData()
+      useWorkspaceStore.getState().clear()
+      const defaults = createAppSettings()
+      settingsRef.current = defaults
+      setSettings(defaults)
+      setPreferences(defaults)
+      failedSettingsWrite.current = null
+      setDeleteStep(0)
+      window.dispatchEvent(new Event('boq-settings-updated'))
+      notify('All local application data was deleted.')
+      navigate('/projects')
+    } catch (reason) {
+      notify(`Could not delete local data: ${reason.message}`, 'error')
+    } finally { setWorking(false) }
+  }
   if(error)return <div className="page-wrap"><p className="eyebrow">PREFERENCES</p><h1>Settings</h1><div className="placeholder-panel" role="alert">Could not load settings: {error} <button className="secondary-button" onClick={()=>window.location.reload()}>Reload</button></div></div>
   if(!settings)return <div className="page-wrap"><p className="eyebrow">PREFERENCES</p><h1>Settings</h1><div className="placeholder-panel" role="status">Loading preferences…</div></div>
   return <div className="page-wrap settings-page">

@@ -7,7 +7,7 @@ import { COLUMN_WIDTH_MAX, COLUMN_WIDTH_MIN, DEFAULT_FILTER } from '../domain/co
 import { parseNumeric } from '../domain/normalization.js'
 import { summarizeProjectResources } from '../domain/projectResources.js'
 import { projectVisibleRowIds } from '../domain/projection.js'
-import { FilterMenu } from '../features/cost-grid/CostGrid.jsx'
+import { FilterMenu } from '../features/filtering/FilterMenu.jsx'
 import { useWorkspaceStore } from '../stores/workspaceStore.js'
 import { projectRoutePath } from '../domain/projectRoutes.js'
 import { notify, useUiStore } from '../stores/uiStore.js'
@@ -39,7 +39,8 @@ export function ResourcesPage() {
   const resizeRef = useRef(null)
   const filterButtonRefs = useRef({})
   const resources = useMemo(() => summarizeProjectResources(sheets), [sheets])
-  const filterRows = useMemo(() => resources.map((resource) => ({
+  // Adapter rows are ephemeral: they map resource aggregates to worksheet filter keys.
+  const resourceFilterRows = useMemo(() => resources.map((resource) => ({
     ...resource,
     id: resource.key,
     resource: resource.name,
@@ -49,7 +50,7 @@ export function ResourcesPage() {
     costPercentage: resource.costPercentage,
     remark: resource.rateStatus === 'multiple' ? 'Multiple rates' : resource.incompleteQuantityLines ? 'Incomplete quantity' : resource.rateStatus === 'incomplete' || resource.rateStatus === 'missing' ? 'Missing rate' : 'Ready',
   })), [resources])
-  const visibleResourceIds = useMemo(() => projectVisibleRowIds(filterRows, filters, sort), [filterRows, filters, sort])
+  const visibleResourceIds = useMemo(() => projectVisibleRowIds(resourceFilterRows, filters, sort), [resourceFilterRows, filters, sort])
   const resourceByKey = useMemo(() => new Map(resources.map((resource) => [resource.key, resource])), [resources])
   const filteredResources = visibleResourceIds.map((id) => resourceByKey.get(id)).filter(Boolean)
 
@@ -205,7 +206,7 @@ export function ResourcesPage() {
       </>}
     {openFilter && <FilterMenu
       column={resourceColumns.find((column) => column.key === openFilter)}
-      rows={filterRows}
+       rows={resourceFilterRows}
       currentFilter={filters[openFilter] ?? { ...DEFAULT_FILTER }}
        sortDirection={sort?.key === openFilter || (sort?.key === undefined && sort?.col === resourceColumns.find((column) => column.key === openFilter)?.index) ? sort.direction : null}
       hasSort={Boolean(sort)}

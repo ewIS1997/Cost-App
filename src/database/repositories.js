@@ -1,3 +1,4 @@
+// Dexie transaction facade: callers rely on atomic sheet/attachment writes and export flush ordering.
 import Dexie from 'dexie'
 import { database } from './database.js'
 import { createAppSettings, createId, createProjectRecord, createSheetRecord, normalizeText } from '../domain/normalization.js'
@@ -5,7 +6,7 @@ import { createUniqueProjectRouteSlug, getProjectRouteSlug } from '../domain/pro
 import { validateAllProjectsBackup, validateAssemblies, validateProject, validateProjectBackup, validateSettings, validateWorksheet } from '../domain/validation.js'
 import { migrateAppSettings, migrateLegacyWorkbook, migrateLegacyWorksheet } from './migrations.js'
 import { createDemoSheets } from '../domain/demoData.js'
-import { createAsyncWriteQueue } from '../domain/asyncWriteQueue.js'
+import { createSaveCoordinator } from './saveCoordinator.js'
 import { normalizeBoqCode } from '../domain/normalization.js'
 import { isImageTargetCurrent, normalizeAttachmentCode } from '../domain/imageAttachments.js'
 import { transitionItemAttachments } from '../domain/imageAttachmentTransitions.js'
@@ -18,32 +19,38 @@ function cloneWithNewRowIds(data) { return {...structuredClone(data),rows:data.r
 async function checkedProject(project,sheets) { assertValid(validateProject(project,sheets),'Persisted project'); return {project,sheets} }
 
 export async function listProjectsWithSheetCounts() {
-  return database.transaction('rw',database.projects,database.sheets,async()=>{
-    const projects=await database.projects.toArray(); const sheets=await database.sheets.toArray()
-    const ordered=[...projects].sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt)||a.id.localeCompare(b.id))
-    const reservedIds=new Set(projects.map((project)=>project.id))
-    const aliasOwner=new Map()
-    for(const project of ordered)for(const alias of Array.isArray(project.routeAliases)?project.routeAliases:[]){
-      if(typeof alias==='string'&&/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(alias)&&!reservedIds.has(alias)&&!aliasOwner.has(alias))aliasOwner.set(alias,project.id)
+  // Listing materializes missing/conflicting route identities for older projects, so this is a write transaction.
+  return database.transaction('rw', database.projects, database.sheets, async () => {
+    const projects = await database.projects.toArray()
+    const sheets = await database.sheets.toArray()
+    const ordered = [...projects].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id))
+    const reservedIds = new Set(projects.map((project) => project.id))
+    const aliasOwner = new Map()
+    for (const project of ordered) for (const alias of Array.isArray(project.routeAliases) ? project.routeAliases : []) {
+      if (typeof alias === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(alias) && !reservedIds.has(alias) && !aliasOwner.has(alias)) aliasOwner.set(alias, project.id)
     }
-    const assigned=[]
-    for(const project of ordered){
-      const requested=project.routeSlug
-      const requestedAvailable=typeof requested==='string'&&/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(requested)&&!reservedIds.has(requested)&&!aliasOwner.has(requested)&&!assigned.some((item)=>getProjectRouteSlug(item)===requested)
-      const routeSlug=requestedAvailable?requested:createUniqueProjectRouteSlug(project.name,[...projects,...assigned],project.id)
-      assigned.push({...project,routeSlug})
+    const assigned = []
+    for (const project of ordered) {
+      const requested = project.routeSlug
+      const requestedAvailable = typeof requested === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(requested) && !reservedIds.has(requested) && !aliasOwner.has(requested) && !assigned.some((item) => getProjectRouteSlug(item) === requested)
+      const routeSlug = requestedAvailable ? requested : createUniqueProjectRouteSlug(project.name, [...projects, ...assigned], project.id)
+      assigned.push({ ...project, routeSlug })
     }
-    const currentSlugs=new Set(assigned.map(getProjectRouteSlug)),usedAliases=new Set(),finalized=[]
-    for(const project of assigned){
-      const oldAliases=Array.isArray(project.routeAliases)?project.routeAliases:[]
-      const routeAliases=[...new Set(oldAliases.filter((alias)=>typeof alias==='string'&&/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(alias)&&alias!==project.routeSlug&&!reservedIds.has(alias)&&!currentSlugs.has(alias)&&!usedAliases.has(alias)))]
-      routeAliases.forEach((alias)=>usedAliases.add(alias))
-      const routedProject={...project,routeAliases}
-      if(project.routeSlug!==projects.find((item)=>item.id===project.id)?.routeSlug||JSON.stringify(routeAliases)!==JSON.stringify(oldAliases))await database.projects.put(routedProject)
+    const currentSlugs = new Set(assigned.map(getProjectRouteSlug)), usedAliases = new Set(), finalized = []
+    for (const project of assigned) {
+      const oldAliases = Array.isArray(project.routeAliases) ? project.routeAliases : []
+      const routeAliases = [...new Set(oldAliases.filter((alias) => typeof alias === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(alias) && alias !== project.routeSlug && !reservedIds.has(alias) && !currentSlugs.has(alias) && !usedAliases.has(alias)))]
+      routeAliases.forEach((alias) => usedAliases.add(alias))
+      const routedProject = { ...project, routeAliases }
+      if (project.routeSlug !== projects.find((item) => item.id === project.id)?.routeSlug || JSON.stringify(routeAliases) !== JSON.stringify(oldAliases)) await database.projects.put(routedProject)
       finalized.push(routedProject)
     }
-    for(const project of finalized){const related=sheets.filter((sheet)=>sheet.projectId===project.id);const errors=validateProject(project,related);if(errors.length)throw new Error(`Project ${project.id} is corrupt: ${errors.join(' ')}`)}
-    return finalized.sort((a,b)=>Date.parse(b.updatedAt)-Date.parse(a.updatedAt)).map((project)=>({...project,sheetCount:sheets.filter((sheet)=>sheet.projectId===project.id).length}))
+    for (const project of finalized) {
+      const related = sheets.filter((sheet) => sheet.projectId === project.id)
+      const errors = validateProject(project, related)
+      if (errors.length) throw new Error(`Project ${project.id} is corrupt: ${errors.join(' ')}`)
+    }
+    return finalized.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).map((project) => ({ ...project, sheetCount: sheets.filter((sheet) => sheet.projectId === project.id).length }))
   })
 }
 export async function loadProjectWithSheets(projectId) {
@@ -211,35 +218,41 @@ export async function renameProject(projectId,name) {
   assertValid(validateProject(project,loaded.sheets),'Renamed project'); await database.projects.put(project); return project
 }
 export async function saveSheetAndProjectTimestamp(sheet,projectTimestamp=now()) {
-  const dataErrors=validateWorksheet(sheet.data); assertValid(dataErrors,'Worksheet')
-  const moved=await database.transaction('rw',database.sheets,database.projects,database.attachments,async()=>{
-    const oldSheet=await database.sheets.get(sheet.id); const project=await database.projects.get(sheet.projectId)
+  const dataErrors = validateWorksheet(sheet.data)
+  assertValid(dataErrors, 'Worksheet')
+  const moved = await database.transaction('rw', database.sheets, database.projects, database.attachments, async () => {
+    const oldSheet = await database.sheets.get(sheet.id)
+    const project = await database.projects.get(sheet.projectId)
     if (!oldSheet||!project) throw new Error('Cannot save a sheet whose project or sheet no longer exists.')
-    const changed=await transitionAttachmentsInTransaction(sheet.id,oldSheet.data.rows,sheet.data.rows)
-    const timestamp=newest(projectTimestamp,now(),oldSheet.updatedAt,project.updatedAt)
-    await database.sheets.put({...sheet,updatedAt:newest(timestamp,sheet.updatedAt)})
-    await database.projects.put({...project,updatedAt:timestamp})
+    const changed = await transitionAttachmentsInTransaction(sheet.id, oldSheet.data.rows, sheet.data.rows)
+    const timestamp = newest(projectTimestamp, now(), oldSheet.updatedAt, project.updatedAt)
+    await database.sheets.put({ ...sheet, updatedAt: newest(timestamp, sheet.updatedAt) })
+    await database.projects.put({ ...project, updatedAt: timestamp })
     return changed
   })
-  if(moved)attachmentChange(sheet.id)
+  // Notify image views only after the sheet and attachment transaction commits.
+  if (moved) attachmentChange(sheet.id)
 }
 export async function saveSheetsAndProjectTimestamp(sheets,projectTimestamp=now()) {
   if (!Array.isArray(sheets) || !sheets.length) return
-  for (const sheet of sheets) assertValid(validateWorksheet(sheet.data),'Worksheet')
-  const projectId=sheets[0].projectId
-  if(sheets.some((sheet)=>sheet.projectId!==projectId))throw new Error('A grouped save cannot span projects.')
-  const movedSheetIds=await database.transaction('rw',database.sheets,database.projects,database.attachments,async()=>{
-    const project=await database.projects.get(projectId)
-    if(!project)throw new Error('Cannot save sheets whose project no longer exists.')
-    const oldSheets=await Promise.all(sheets.map((sheet)=>database.sheets.get(sheet.id)))
-    if(oldSheets.some((sheet)=>!sheet))throw new Error('Cannot save a grouped change because a worksheet no longer exists.')
-    const moved=[]
-    for(let index=0;index<sheets.length;index++)if(await transitionAttachmentsInTransaction(sheets[index].id,oldSheets[index].data.rows,sheets[index].data.rows))moved.push(sheets[index].id)
-    const timestamp=newest(projectTimestamp,now(),project.updatedAt,...oldSheets.map((sheet)=>sheet.updatedAt))
-    await database.sheets.bulkPut(sheets.map((sheet,index)=>({...sheet,updatedAt:newest(timestamp,sheet.updatedAt,oldSheets[index].updatedAt)})))
-    await database.projects.put({...project,updatedAt:timestamp})
+  for (const sheet of sheets) assertValid(validateWorksheet(sheet.data), 'Worksheet')
+  const projectId = sheets[0].projectId
+  if (sheets.some((sheet) => sheet.projectId !== projectId)) throw new Error('A grouped save cannot span projects.')
+  const movedSheetIds = await database.transaction('rw', database.sheets, database.projects, database.attachments, async () => {
+    const project = await database.projects.get(projectId)
+    if (!project) throw new Error('Cannot save sheets whose project no longer exists.')
+    const oldSheets = await Promise.all(sheets.map((sheet) => database.sheets.get(sheet.id)))
+    if (oldSheets.some((sheet) => !sheet)) throw new Error('Cannot save a grouped change because a worksheet no longer exists.')
+    const moved = []
+    for (let index = 0; index < sheets.length; index++) {
+      if (await transitionAttachmentsInTransaction(sheets[index].id, oldSheets[index].data.rows, sheets[index].data.rows)) moved.push(sheets[index].id)
+    }
+    const timestamp = newest(projectTimestamp, now(), project.updatedAt, ...oldSheets.map((sheet) => sheet.updatedAt))
+    await database.sheets.bulkPut(sheets.map((sheet, index) => ({ ...sheet, updatedAt: newest(timestamp, sheet.updatedAt, oldSheets[index].updatedAt) })))
+    await database.projects.put({ ...project, updatedAt: timestamp })
     return moved
   })
+  // Emit attachment updates after the atomic grouped transaction commits.
   movedSheetIds.forEach(attachmentChange)
 }
 export async function createSheet(projectId,name,defaultRemarkVisible=false) {
@@ -259,16 +272,24 @@ export async function renameSheet(sheetId,name) {
   })
 }
 export async function duplicateSheet(sheetId,name) {
-  return database.transaction('rw',database.projects,database.sheets,database.attachments,database.attachmentBlobs,async()=>{
-    const source=await database.sheets.get(sheetId); if(!source) throw new Error('Sheet not found.')
-    const project=await database.projects.get(source.projectId); const sheets=(await database.sheets.where('projectId').equals(source.projectId).toArray()).sort((a,b)=>a.position-b.position)
-    if(sheets.length>=100) throw new Error('A project cannot contain more than 100 sheets.')
-    const position=source.position+1; const timestamp=newest(now(),project.updatedAt)
-    const copy={...structuredClone(source),id:createId(),name:normalizeText(name),position,data:cloneWithNewRowIds(source.data),createdAt:timestamp,updatedAt:timestamp}
-    const next=sheets.map((s)=>s.position>=position?{...s,position:s.position+1}:s); next.splice(position,0,copy)
-    assertValid(validateProject(project,next),'Duplicated sheet')
-    const attachments=await duplicateSheetAttachments(source,copy)
-    await database.sheets.bulkPut(next.map((s)=>({...s,updatedAt:timestamp}))); if(attachments.metadata.length)await database.attachments.bulkAdd(attachments.metadata);if(attachments.imageBlobs.length)await database.attachmentBlobs.bulkAdd(attachments.imageBlobs); await database.projects.put({...project,updatedAt:timestamp}); return copy
+  return database.transaction('rw', database.projects, database.sheets, database.attachments, database.attachmentBlobs, async () => {
+    const source = await database.sheets.get(sheetId)
+    if (!source) throw new Error('Sheet not found.')
+    const project = await database.projects.get(source.projectId)
+    const sheets = (await database.sheets.where('projectId').equals(source.projectId).toArray()).sort((a, b) => a.position - b.position)
+    if (sheets.length >= 100) throw new Error('A project cannot contain more than 100 sheets.')
+    const position = source.position + 1
+    const timestamp = newest(now(), project.updatedAt)
+    const copy = { ...structuredClone(source), id: createId(), name: normalizeText(name), position, data: cloneWithNewRowIds(source.data), createdAt: timestamp, updatedAt: timestamp }
+    const next = sheets.map((s) => s.position >= position ? { ...s, position: s.position + 1 } : s)
+    next.splice(position, 0, copy)
+    assertValid(validateProject(project, next), 'Duplicated sheet')
+    const attachments = await duplicateSheetAttachments(source, copy)
+    await database.sheets.bulkPut(next.map((s) => ({ ...s, updatedAt: timestamp })))
+    if (attachments.metadata.length) await database.attachments.bulkAdd(attachments.metadata)
+    if (attachments.imageBlobs.length) await database.attachmentBlobs.bulkAdd(attachments.imageBlobs)
+    await database.projects.put({ ...project, updatedAt: timestamp })
+    return copy
   })
 }
 export async function deleteSheet(sheetId) {
@@ -294,63 +315,7 @@ export async function deleteProject(projectId) { return database.transaction('rw
 export async function readSettings() { let settings=await database.settings.get('app'); if(!settings){settings=createAppSettings();await database.settings.add(settings)} else if(settings.schemaVersion===1||settings.schemaVersion===2) { settings=migrateAppSettings(settings); await database.settings.put(settings) } assertValid(validateSettings(settings),'Persisted settings'); return settings }
 export async function writeSettings(settings) { assertValid(validateSettings(settings),'Settings'); await database.settings.put(settings); return settings }
 
-const pending=new Map()
-const projectWriteQueues=new Map()
-const status=(entry,value,error)=>entry.listeners.forEach((listener)=>listener(value,error))
-function enqueueProjectWrite(projectId,write) {
-  const queue=projectWriteQueues.get(projectId)??createAsyncWriteQueue()
-  projectWriteQueues.set(projectId,queue)
-  return queue.enqueue(write)
-}
-async function persistLatest(entry) {
-  if(entry.active) return entry.active
-   entry.active=(async()=>{while(entry.latest){const pendingSnapshot=entry.latest;entry.latest=null;status(entry,'Saving...');try{await enqueueProjectWrite(pendingSnapshot.projectId,()=>saveSheetAndProjectTimestamp(pendingSnapshot));entry.dirty=Boolean(entry.latest);if(!entry.dirty){if(entry.groupPending)entry.savedDuringGroup=true;else status(entry,'Saved')}}catch(error){if(!entry.latest)entry.latest=pendingSnapshot;entry.dirty=true;status(entry,'Save failed',error);throw error}}})().finally(()=>{entry.active=null})
-  return entry.active
-}
-export const saveCoordinator={
-  subscribe(sheetId,callback){const entry=pending.get(sheetId)||{listeners:new Set(),latest:null,active:null,timer:null,dirty:false};entry.listeners.add(callback);pending.set(sheetId,entry);return()=>entry.listeners.delete(callback)},
-  schedule(sheet){const entry=pending.get(sheet.id)||{listeners:new Set(),latest:null,active:null,timer:null,dirty:false};entry.projectId=sheet.projectId;entry.latest=structuredClone(sheet);entry.dirty=true;clearTimeout(entry.timer);entry.timer=setTimeout(()=>persistLatest(entry).catch(()=>{}),500);pending.set(sheet.id,entry)},
-  async saveNow(sheet){const entry=pending.get(sheet.id)||{listeners:new Set(),latest:null,active:null,timer:null,dirty:false};entry.projectId=sheet.projectId;entry.latest=structuredClone(sheet);entry.dirty=true;clearTimeout(entry.timer);pending.set(sheet.id,entry);return persistLatest(entry)},
-   async saveGroup(sheetsOrSupplier){
-     const initial=typeof sheetsOrSupplier==='function'?sheetsOrSupplier():sheetsOrSupplier
-     const projectId=initial[0]?.projectId
-     if(!projectId)return
-     const sheetIds=initial.map((sheet)=>sheet.id)
-     const entries=sheetIds.map((id)=>pending.get(id)).filter(Boolean)
-     entries.forEach((entry)=>{entry.groupPending=(entry.groupPending??0)+1})
-     try {
-       await this.flushProject(projectId)
-       const latest=typeof sheetsOrSupplier==='function'?sheetsOrSupplier():initial
-       await enqueueProjectWrite(projectId,()=>saveSheetsAndProjectTimestamp(latest))
-       for(const sheet of latest){
-         const entry=pending.get(sheet.id)
-         if(!entry)continue
-         entry.groupPending=Math.max(0,(entry.groupPending??1)-1)
-         if(!entry.latest&&!entry.active){entry.dirty=false;entry.savedDuringGroup=false;if(!entry.groupPending)status(entry,'Saved')}
-       }
-     } catch(error) {
-       for(const sheet of initial){
-         const entry=pending.get(sheet.id)
-         if(!entry)continue
-         entry.groupPending=Math.max(0,(entry.groupPending??1)-1)
-         entry.latest=entry.latest??structuredClone(sheet);entry.dirty=true
-         status(entry,'Save failed',error)
-       }
-       throw error
-     }
-  },
-  async retry(sheetId){const entry=pending.get(sheetId);if(!entry?.latest) return;return persistLatest(entry)},
-   async flushProject(projectId){
-     while(true){
-       const entries=[...pending.values()].filter((entry)=>entry.projectId===projectId&&(entry.dirty||entry.active))
-       await Promise.all(entries.map((entry)=>{clearTimeout(entry.timer);return persistLatest(entry)}))
-       const queued=projectWriteQueues.get(projectId)
-       if(queued)await queued.idle()
-       if(![...pending.values()].some((entry)=>entry.projectId===projectId&&(entry.dirty||entry.active)))return
-     }
-   },
-  async flushAll(){await Promise.all([...pending.values()].filter((entry)=>entry.dirty||entry.active).map((entry)=>{clearTimeout(entry.timer);return persistLatest(entry)}))},
-}
+export const saveCoordinator=createSaveCoordinator(saveSheetAndProjectTimestamp,saveSheetsAndProjectTimestamp)
 if (typeof window!=='undefined') window.addEventListener('pagehide',()=>{saveCoordinator.flushAll().catch(()=>{})})
 
 export async function exportProjectSnapshot(projectId) {
@@ -365,25 +330,62 @@ export async function exportProjectSnapshot(projectId) {
 }
 export async function exportAllProjectsSnapshot() {
   await saveCoordinator.flushAll()
-  const snapshot=await database.transaction('r',database.projects,database.sheets,database.assemblies,database.attachments,database.attachmentBlobs,database.settings,async()=>{const metadata=await database.attachments.toArray();return {projects:await database.projects.toArray(),sheets:await database.sheets.toArray(),assemblies:await database.assemblies.toArray(),attachments:await hydrateAttachments(metadata),settings:await readSettings()}})
-  return {...snapshot,attachments:await Promise.all(snapshot.attachments.map(encodeAttachmentForBackup))}
+  const snapshot = await database.transaction('r', database.projects, database.sheets, database.assemblies, database.attachments, database.attachmentBlobs, database.settings, async () => {
+    const metadata = await database.attachments.toArray()
+    return {
+      projects: await database.projects.toArray(),
+      sheets: await database.sheets.toArray(),
+      assemblies: await database.assemblies.toArray(),
+      attachments: await hydrateAttachments(metadata),
+      settings: await readSettings(),
+    }
+  })
+  return { ...snapshot, attachments: await Promise.all(snapshot.attachments.map(encodeAttachmentForBackup)) }
 }
 export async function importProjectAsNew(backup) {
-  assertValid(validateProjectBackup(backup),'Project backup')
-  const timestamp=now(),projectId=createId(),sheetIds=new Map(backup.sheets.map((s)=>[s.id,createId()]))
-  const sheets=backup.sheets.map((s,index)=>({...structuredClone(s),id:sheetIds.get(s.id),projectId,position:index,data:cloneWithNewRowIds(s.data),createdAt:timestamp,updatedAt:timestamp}))
-  const assemblies=(backup.assemblies??[]).map((assembly)=>({...structuredClone(assembly),id:createId(),projectId,createdAt:timestamp,updatedAt:timestamp}))
-   const project={...backup.project,id:projectId,routeSlug:createUniqueProjectRouteSlug(backup.project.name,await database.projects.toArray()),routeAliases:[],activeSheetId:sheetIds.get(backup.project.activeSheetId),createdAt:timestamp,updatedAt:timestamp}
-  assertValid(validateProject(project,sheets),'Imported project')
-    await database.transaction('rw',database.projects,database.sheets,database.assemblies,database.attachments,database.attachmentBlobs,async()=>{await database.projects.add(project);await database.sheets.bulkAdd(sheets);if(assemblies.length)await database.assemblies.bulkAdd(assemblies);const attachments=(backup.attachments??[]).flatMap((attachment)=>{const sourceSheet=backup.sheets.find((item)=>item.id===attachment.sheetId);const targetSheet=sheets.find((item)=>item.id===sheetIds.get(attachment.sheetId));return sourceSheet&&targetSheet?[{...normalizeAttachmentOwnership(decodeAttachmentFromBackup(attachment),sourceSheet,targetSheet),id:createId(),projectId,sheetId:targetSheet.id}]:[]});const split=splitAttachmentRecords(attachments);if(split.metadata.length)await database.attachments.bulkAdd(split.metadata);if(split.imageBlobs.length)await database.attachmentBlobs.bulkAdd(split.imageBlobs)})
-  return {project,sheets,assemblies}
+  assertValid(validateProjectBackup(backup), 'Project backup')
+  const timestamp = now(), projectId = createId(), sheetIds = new Map(backup.sheets.map((s) => [s.id, createId()]))
+  const sheets = backup.sheets.map((s, index) => ({ ...structuredClone(s), id: sheetIds.get(s.id), projectId, position: index, data: cloneWithNewRowIds(s.data), createdAt: timestamp, updatedAt: timestamp }))
+  const assemblies = (backup.assemblies ?? []).map((assembly) => ({ ...structuredClone(assembly), id: createId(), projectId, createdAt: timestamp, updatedAt: timestamp }))
+  const project = { ...backup.project, id: projectId, routeSlug: createUniqueProjectRouteSlug(backup.project.name, await database.projects.toArray()), routeAliases: [], activeSheetId: sheetIds.get(backup.project.activeSheetId), createdAt: timestamp, updatedAt: timestamp }
+  assertValid(validateProject(project, sheets), 'Imported project')
+  await database.transaction('rw', database.projects, database.sheets, database.assemblies, database.attachments, database.attachmentBlobs, async () => {
+    await database.projects.add(project)
+    await database.sheets.bulkAdd(sheets)
+    if (assemblies.length) await database.assemblies.bulkAdd(assemblies)
+    const attachments = (backup.attachments ?? []).flatMap((attachment) => {
+      const sourceSheet = backup.sheets.find((item) => item.id === attachment.sheetId)
+      const targetSheet = sheets.find((item) => item.id === sheetIds.get(attachment.sheetId))
+      return sourceSheet && targetSheet ? [{ ...normalizeAttachmentOwnership(decodeAttachmentFromBackup(attachment), sourceSheet, targetSheet), id: createId(), projectId, sheetId: targetSheet.id }] : []
+    })
+    const split = splitAttachmentRecords(attachments)
+    if (split.metadata.length) await database.attachments.bulkAdd(split.metadata)
+    if (split.imageBlobs.length) await database.attachmentBlobs.bulkAdd(split.imageBlobs)
+  })
+  return { project, sheets, assemblies }
 }
 export async function replaceAllProjects(backup) {
-  if (backup?.settings?.schemaVersion===1||backup?.settings?.schemaVersion===2) backup={...backup,settings:migrateAppSettings(backup.settings)}
-  assertValid(validateAllProjectsBackup(backup),'All-projects backup')
-   const attachments=splitAttachmentRecords((backup.attachments??[]).map((attachment)=>{const sheet=backup.sheets.find((item)=>item.id===attachment.sheetId);return normalizeAttachmentOwnership(decodeAttachmentFromBackup(attachment),sheet)}))
-   await database.transaction('rw',database.projects,database.sheets,database.assemblies,database.attachments,database.attachmentBlobs,database.settings,async()=>{await database.projects.clear();await database.sheets.clear();await database.assemblies.clear();await database.attachments.clear();await database.attachmentBlobs.clear();await database.settings.clear();await database.projects.bulkAdd(backup.projects);await database.sheets.bulkAdd(backup.sheets);if(backup.assemblies?.length)await database.assemblies.bulkAdd(backup.assemblies);if(attachments.metadata.length)await database.attachments.bulkAdd(attachments.metadata);if(attachments.imageBlobs.length)await database.attachmentBlobs.bulkAdd(attachments.imageBlobs);await database.settings.put(backup.settings)})
-  return {clearWorkspace:true,route:'/projects'}
+  if (backup?.settings?.schemaVersion === 1 || backup?.settings?.schemaVersion === 2) backup = { ...backup, settings: migrateAppSettings(backup.settings) }
+  assertValid(validateAllProjectsBackup(backup), 'All-projects backup')
+  const attachments = splitAttachmentRecords((backup.attachments ?? []).map((attachment) => {
+    const sheet = backup.sheets.find((item) => item.id === attachment.sheetId)
+    return normalizeAttachmentOwnership(decodeAttachmentFromBackup(attachment), sheet)
+  }))
+  await database.transaction('rw', database.projects, database.sheets, database.assemblies, database.attachments, database.attachmentBlobs, database.settings, async () => {
+    await database.projects.clear()
+    await database.sheets.clear()
+    await database.assemblies.clear()
+    await database.attachments.clear()
+    await database.attachmentBlobs.clear()
+    await database.settings.clear()
+    await database.projects.bulkAdd(backup.projects)
+    await database.sheets.bulkAdd(backup.sheets)
+    if (backup.assemblies?.length) await database.assemblies.bulkAdd(backup.assemblies)
+    if (attachments.metadata.length) await database.attachments.bulkAdd(attachments.metadata)
+    if (attachments.imageBlobs.length) await database.attachmentBlobs.bulkAdd(attachments.imageBlobs)
+    await database.settings.put(backup.settings)
+  })
+  return { clearWorkspace: true, route: '/projects' }
 }
 export async function deleteAllLocalData() {
   await database.transaction('rw',database.projects,database.sheets,database.assemblies,database.attachments,database.attachmentBlobs,database.settings,async()=>{

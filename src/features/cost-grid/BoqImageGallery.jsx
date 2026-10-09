@@ -25,7 +25,12 @@ export function BoqImageGallery({ attachments, onPreview, onDeleteRequest, onAdd
 
   return <div className="boq-image-gallery" role="group" aria-label={`Images for ${attachments[0].boqCode}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
       {attachments.map((attachment) => <div className="boq-image-thumbnail" key={attachment.id}>
-        <button type="button" className="boq-image-open" title={`View image for ${attachment.boqCode}`} aria-label={`View image ${attachment.position + 1} for ${attachment.boqCode}`} disabled={!urls[attachment.id]} onClick={() => onPreview(attachment)}>
+        <button type="button" className="boq-image-open" title={`Double-click to view image ${attachment.position + 1}`} aria-label={`View image ${attachment.position + 1} for ${attachment.boqCode}`} disabled={!urls[attachment.id]}
+          onClick={(event) => {
+            const touchInput = window.matchMedia?.('(pointer: coarse)').matches
+            if (event.detail === 0 || touchInput) onPreview(attachment)
+          }}
+          onDoubleClick={() => onPreview(attachment)}>
           {urls[attachment.id] ? <img src={urls[attachment.id]} alt={`Detail image ${attachment.position + 1} for ${attachment.boqCode}`} loading="lazy" onLoad={onImageLoad} /> : <span>Loading image…</span>}
         </button>
         <button type="button" className="boq-image-delete" title="Delete image" aria-label={`Delete image ${attachment.position + 1} for ${attachment.boqCode}`} onClick={() => onDeleteRequest(attachment)}>×</button>

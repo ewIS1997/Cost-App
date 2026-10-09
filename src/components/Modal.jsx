@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 
-export function Modal({ title, children, onClose }) {
+export function Modal({ title, children, onClose, size }) {
   const dialogRef = useRef(null)
   const restoreRef = useRef(null)
   useEffect(() => {
@@ -19,7 +19,7 @@ export function Modal({ title, children, onClose }) {
     return () => { dialog.removeEventListener('keydown', onKeyDown); restoreRef.current?.focus?.() }
   }, [onClose])
   return createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-    <section className="modal" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="modal-title">
+     <section className={`modal${size ? ` modal-${size}` : ''}`} ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="modal-title">
        <header><h2 id="modal-title">{title}</h2><button type="button" onClick={onClose} aria-label="Close dialog">×</button></header>{children}
     </section>
   </div>, document.body)
